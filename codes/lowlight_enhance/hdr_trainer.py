@@ -127,6 +127,82 @@ def poisson_gaussian_nll_loss(rendered: Tensor, gt: Tensor, eps: float = 1e-3) -
     return torch.mean(residual + log_term)
 
 
+def get_curriculum_exposure(step: int, max_steps: int, max_exposure: float = 10.0) -> float:
+    """Get curriculum exposure based on training progress (Idea #6).
+    
+    Phase 1 (0-30%): Reconstruct dark images (exposure ~1.0)
+    Phase 2 (30-70%): Gradually increase (exposure 1.0 → 5.0)
+    Phase 3 (70-100%): Target bright images (exposure 5.0 → max_exposure)
+    
+    Args:
+        step: Current training step
+        max_steps: Total number of training steps
+        max_exposure: Maximum exposure value (default: 10.0)
+        
+    Returns:
+        Target exposure value for current step
+    """
+    progress = step / max_steps if max_steps > 0 else 0.0
+    
+    if progress < 0.3:
+        # Phase 1: Reconstruct dark (exposure = 1.0)
+        return 1.0
+    elif progress < 0.7:
+        # Phase 2: Gradual increase from 1.0 to 5.0
+        phase_progress = (progress - 0.3) / 0.4  # 0.0 to 1.0 within phase 2
+        return 1.0 + phase_progress * 4.0  # 1.0 → 5.0
+    else:
+        # Phase 3: Target bright from 5.0 to max_exposure
+        phase_progress = (progress - 0.7) / 0.3  # 0.0 to 1.0 within phase 3
+        return 5.0 + phase_progress * (max_exposure - 5.0)  # 5.0 → max_exposure
+
+
+def generate_synthetic_exposures(
+    dark_image: Tensor, 
+    num_exposures: int = 5,
+    min_exposure: float = 0.5,
+    max_exposure: float = 5.0
+) -> Tuple[List[Tensor], List[float]]:
+    """Generate synthetic multi-exposure training data from single dark image (Idea #2).
+    
+    Creates training triplets: (dark, mid, bright) from single dark image.
+    Key insight: Even if GT is dark, we can create synthetic bright versions
+    and enforce consistency in learned radiance space.
+    
+    Args:
+        dark_image: Dark input image tensor [H, W, 3] or [1, H, W, 3]
+        num_exposures: Number of synthetic exposures to generate
+        min_exposure: Minimum exposure factor
+        max_exposure: Maximum exposure factor
+        
+    Returns:
+        Tuple of (synthetic_images, exposures) where:
+        - synthetic_images: List of synthetic image tensors
+        - exposures: List of corresponding exposure values
+    """
+    # Ensure image is 4D [1, H, W, 3]
+    if dark_image.dim() == 3:
+        dark_image = dark_image.unsqueeze(0)
+    
+    exposures = torch.linspace(min_exposure, max_exposure, num_exposures).tolist()
+    synthetic_images = []
+    
+    for exp in exposures:
+        # Simple: Just brighten the image
+        synthetic = dark_image * exp
+        
+        # Better: Add noise model (bright images have less relative noise)
+        noise_level = 0.01 / exp  # Less noise in bright images
+        noise = torch.randn_like(synthetic) * noise_level
+        synthetic = synthetic + noise
+        
+        # Clamp to valid range
+        synthetic = torch.clamp(synthetic, 0.0, 1.0)
+        synthetic_images.append(synthetic)
+    
+    return synthetic_images, exposures
+
+
 # ============================================================================
 # Exposure Optimization Module
 # ============================================================================
@@ -781,6 +857,22 @@ class Config:
     log_space_eps: float = 1e-3
 
     # ========================================================================
+    # Recommended Strategy Parameters (Ideas #1, #2, #4, #6)
+    # ========================================================================
+    # Intrinsic decomposition (Idea #1)
+    enable_intrinsic_decomp: bool = False
+    albedo_reg_lambda: float = 0.01
+    illum_reg_lambda: float = 0.01
+    
+    # Multi-exposure synthesis (Idea #2)
+    enable_synthetic_exposures: bool = False
+    num_synthetic_exposures: int = 5
+    
+    # Curriculum learning (Idea #6)
+    curriculum_enabled: bool = True
+    curriculum_max_exposure: float = 10.0
+
+    # ========================================================================
     # Opacity Pruning Protection Parameters
     # ========================================================================
     # Minimum opacity threshold (lower than default 0.005 to prevent aggressive pruning)
@@ -839,6 +931,7 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    enable_intrinsic_decomp: bool = False,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -872,11 +965,28 @@ def create_splats_with_optimizers(
     ]
 
     if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        if enable_intrinsic_decomp:
+            # Intrinsic decomposition: Split into albedo (invariant) + illumination (variant)
+            # Albedo: Exposure-invariant reflectance (what color is the surface?)
+            albedo_sh0 = rgb_to_sh(rgbs)  # Initialize from RGB [N, 1, 3]
+            # Higher-order SH: (sh_degree + 1)^2 - 1 coefficients (excluding sh0)
+            num_sh_coeffs = (sh_degree + 1) ** 2 - 1
+            albedo_shN = torch.zeros((N, num_sh_coeffs, 3))  # Higher-order SH for albedo
+            
+            # Illumination: Exposure-dependent lighting (how much light hits it?)
+            illum_sh0 = torch.zeros((N, 1, 3))  # Initialize to small values
+            illum_shN = torch.zeros((N, num_sh_coeffs, 3))  # Higher-order SH for illumination
+            
+            params.append(("albedo_sh0", torch.nn.Parameter(albedo_sh0), sh0_lr))
+            params.append(("albedo_shN", torch.nn.Parameter(albedo_shN), shN_lr))
+            params.append(("illum_sh0", torch.nn.Parameter(illum_sh0), sh0_lr))
+            params.append(("illum_shN", torch.nn.Parameter(illum_shN), shN_lr))
+        else:
+            # Standard: color is SH coefficients.
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = rgb_to_sh(rgbs)
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -951,7 +1061,8 @@ class Runner:
             # Write header row
             self.csv_writer.writerow([
                 'step', 'loss', 'loss_nll', 'l1loss', 'ssimloss', 
-                'loss_ratio', 'loss_sh', 'depthloss', 'tvloss',
+                'loss_ratio', 'loss_sh', 'loss_albedo_reg', 'loss_illum_sparse',
+                'curriculum_exposure', 'depthloss', 'tvloss',
                 'exposure_mean', 'exposure_std', 'num_GS', 'mem',
                 'min_GS_reached', 'pruning_protection_active'
             ])
@@ -998,6 +1109,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            enable_intrinsic_decomp=cfg.enable_intrinsic_decomp,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -1170,6 +1282,36 @@ class Runner:
             )
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
+        elif self.cfg.enable_intrinsic_decomp:
+            # Intrinsic decomposition: colors = albedo + illumination * exposure
+            # Get exposure value (default to 1.0 if not provided)
+            exposure_value = kwargs.pop("exposure_value", None)
+            if exposure_value is None:
+                if apply_exposure and image_ids is not None and self.cfg.enable_exposure_opt:
+                    if self.world_size > 1:
+                        exposure_value = self.exposure_module.module(image_ids)  # [B,]
+                    else:
+                        exposure_value = self.exposure_module(image_ids)  # [B,]
+                else:
+                    # Default to 1.0 if no exposure module or not applying exposure
+                    exposure_value = torch.ones(camtoworlds.shape[0], device=self.device)
+            
+            # Combine albedo and illumination
+            albedo = torch.cat([self.splats["albedo_sh0"], self.splats["albedo_shN"]], 1)  # [N, K, 3]
+            illumination = torch.cat([self.splats["illum_sh0"], self.splats["illum_shN"]], 1)  # [N, K, 3]
+            
+            # Final color = albedo + illumination * exposure
+            # In SH space: addition (since we're in log space conceptually)
+            # For per-image exposure: Since colors are per-Gaussian but exposure is per-image,
+            # we need to handle this. For now, use mean exposure across batch (typical batch_size=1)
+            # A more sophisticated approach would rasterize separately, but that's expensive
+            if exposure_value.numel() > 0:
+                exposure_scalar = exposure_value.mean().item()  # Use mean for simplicity
+            else:
+                exposure_scalar = 1.0
+            
+            # Combine: colors = albedo + illumination * exposure
+            colors = albedo + illumination * exposure_scalar
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
@@ -1203,7 +1345,9 @@ class Runner:
         )
         
         # Apply exposure if enabled and requested
-        if apply_exposure and self.cfg.enable_exposure_opt and image_ids is not None:
+        # Note: For intrinsic decomposition, exposure is already applied in color computation
+        if (apply_exposure and self.cfg.enable_exposure_opt and image_ids is not None 
+            and not self.cfg.enable_intrinsic_decomp):
             if self.world_size > 1:
                 exposures = self.exposure_module.module(image_ids)  # [B,]
             else:
@@ -1312,7 +1456,32 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
+            # Curriculum learning: Get target exposure for this step
+            target_exposure = None
+            if cfg.curriculum_enabled:
+                target_exposure = get_curriculum_exposure(step, max_steps, cfg.curriculum_max_exposure)
+            else:
+                target_exposure = None  # Explicitly set to None if disabled
+            
+            # Multi-exposure synthesis: Generate synthetic bright target if enabled
+            pixels_target = pixels  # Default to original dark image
+            if cfg.enable_synthetic_exposures and target_exposure is not None:
+                # Generate synthetic bright target
+                pixels_target = pixels * target_exposure
+                # Add noise model (less noise in bright images)
+                noise_level = 0.01 / target_exposure
+                noise = torch.randn_like(pixels_target) * noise_level
+                pixels_target = pixels_target + noise
+                pixels_target = torch.clamp(pixels_target, 0.0, 1.0)
+
             # forward
+            # For intrinsic decomposition with curriculum, pass exposure_value
+            exposure_value_kwarg = {}
+            if cfg.enable_intrinsic_decomp and target_exposure is not None:
+                exposure_value_kwarg["exposure_value"] = torch.tensor(
+                    [target_exposure], device=device, dtype=torch.float32
+                )
+            
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -1325,6 +1494,7 @@ class Runner:
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
                 apply_exposure=True,  # Apply exposure during training
+                **exposure_value_kwarg,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -1364,37 +1534,42 @@ class Runner:
             ssimloss = None
             loss_ratio = None
             loss_sh = None
+            loss_albedo_reg = None
+            loss_illum_sparse = None
             depthloss = None
             tvloss = None
+            
+            # Use synthetic target if enabled, otherwise use original pixels
+            pixels_loss_target = pixels_target if cfg.enable_synthetic_exposures else pixels
             
             if cfg.use_log_space_loss:
                 # Log-space training for extremely dark datasets (boosts gradients for dark objects)
                 loss = F.l1_loss(
                     torch.log(colors + cfg.log_space_eps),
-                    torch.log(pixels + cfg.log_space_eps)
+                    torch.log(pixels_loss_target + cfg.log_space_eps)
                 )
                 # Optional: Add SSIM loss for better perceptual quality
                 if cfg.ssim_lambda > 0:
                     ssimloss = 1.0 - fused_ssim(
-                        colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                        colors.permute(0, 3, 1, 2), pixels_loss_target.permute(0, 3, 1, 2), padding="valid"
                     )
                     loss = loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             elif cfg.use_nll_loss:
                 # Poisson-Gaussian NLL Loss (primary loss for HDR)
-                loss_nll = poisson_gaussian_nll_loss(colors, pixels)
+                loss_nll = poisson_gaussian_nll_loss(colors, pixels_loss_target)
                 loss = loss_nll
                 
                 # Optional: Add SSIM loss for better perceptual quality
                 if cfg.ssim_lambda > 0:
                     ssimloss = 1.0 - fused_ssim(
-                        colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                        colors.permute(0, 3, 1, 2), pixels_loss_target.permute(0, 3, 1, 2), padding="valid"
                     )
                     loss = loss_nll * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             else:
                 # Fallback to L1+SSIM if NLL is disabled
-                l1loss = F.l1_loss(colors, pixels)
+                l1loss = F.l1_loss(colors, pixels_loss_target)
                 ssimloss = 1.0 - fused_ssim(
-                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                    colors.permute(0, 3, 1, 2), pixels_loss_target.permute(0, 3, 1, 2), padding="valid"
                 )
                 loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
@@ -1439,8 +1614,21 @@ class Runner:
                         R_i, R_j = radiances[0], radiances[1]
                         exp_i, exp_j = exposures_list[0], exposures_list[1]
                         
-                        # Ratio loss: |R_i / exp_i - R_j / exp_j|
-                        # Normalize radiances by exposure
+                        # Enhanced ratio loss (Idea #4): Use brightness ratios from GT
+                        # Compute GT brightness ratio (this is ground truth)
+                        img_i_gt = ratio_data[0]["image"].to(device)
+                        img_j_gt = ratio_data[1]["image"].to(device)
+                        brightness_i = img_i_gt.mean()
+                        brightness_j = img_j_gt.mean()
+                        gt_ratio = brightness_i / (brightness_j + 1e-6)
+                        
+                        # Compute learned exposure ratio
+                        learned_ratio = exp_i / (exp_j + 1e-6)
+                        
+                        # Ratio loss: exposure ratios should match brightness ratios
+                        loss_ratio_exp = F.l1_loss(learned_ratio, gt_ratio)
+                        
+                        # HDR consistency: Normalize radiances by exposure
                         I_i = R_i / (exp_i.view(-1, 1, 1, 1) + 1e-8)
                         I_j = R_j / (exp_j.view(-1, 1, 1, 1) + 1e-8)
                         
@@ -1453,7 +1641,11 @@ class Runner:
                                 align_corners=False
                             ).permute(0, 2, 3, 1)
                         
-                        loss_ratio = F.l1_loss(I_i, I_j)
+                        # HDR consistency loss: HDR radiance should be similar after exposure correction
+                        loss_hdr_consistency = F.l1_loss(I_i, I_j.detach())
+                        
+                        # Combined ratio loss
+                        loss_ratio = loss_ratio_exp + 0.1 * loss_hdr_consistency
                         loss += cfg.ratio_lambda * loss_ratio
                 except Exception as e:
                     # Skip ratio loss if there's an error (e.g., different image sizes)
@@ -1462,8 +1654,24 @@ class Runner:
 
             # SH regularization (separate global vs local light)
             if cfg.sh_reg_lambda > 0:
-                loss_sh = (self.splats["shN"] ** 2).mean()
+                if cfg.enable_intrinsic_decomp:
+                    # For intrinsic decomposition, regularize illumination SH
+                    loss_sh = (self.splats["illum_shN"] ** 2).mean()
+                else:
+                    loss_sh = (self.splats["shN"] ** 2).mean()
                 loss += cfg.sh_reg_lambda * loss_sh
+            
+            # Intrinsic decomposition regularization losses (Idea #1)
+            if cfg.enable_intrinsic_decomp:
+                # Albedo smoothness: Encourage exposure-invariant albedo
+                if cfg.albedo_reg_lambda > 0:
+                    loss_albedo_reg = self.splats["albedo_sh0"].var() * cfg.albedo_reg_lambda
+                    loss += loss_albedo_reg
+                
+                # Illumination sparsity: Encourage sparse illumination (most light from few directions)
+                if cfg.illum_reg_lambda > 0:
+                    loss_illum_sparse = self.splats["illum_shN"].abs().mean() * cfg.illum_reg_lambda
+                    loss += loss_illum_sparse
 
             if cfg.depth_loss:
                 # query depths from depth map
@@ -1537,6 +1745,13 @@ class Runner:
                     self.writer.add_scalar("train/exposure_std", exposures.std().item(), step)
                 if cfg.sh_reg_lambda > 0:
                     self.writer.add_scalar("train/sh_reg", loss_sh.item(), step)
+                if cfg.enable_intrinsic_decomp:
+                    if loss_albedo_reg is not None:
+                        self.writer.add_scalar("train/albedo_reg", loss_albedo_reg.item(), step)
+                    if loss_illum_sparse is not None:
+                        self.writer.add_scalar("train/illum_sparse", loss_illum_sparse.item(), step)
+                if cfg.curriculum_enabled and target_exposure is not None:
+                    self.writer.add_scalar("train/curriculum_exposure", target_exposure, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
@@ -1556,6 +1771,9 @@ class Runner:
                     row.append(ssimloss.item() if ssimloss is not None else None)
                     row.append(loss_ratio.item() if loss_ratio is not None else None)
                     row.append(loss_sh.item() if loss_sh is not None else None)
+                    row.append(loss_albedo_reg.item() if loss_albedo_reg is not None else None)
+                    row.append(loss_illum_sparse.item() if loss_illum_sparse is not None else None)
+                    row.append(target_exposure if cfg.curriculum_enabled and target_exposure is not None else None)
                     row.append(depthloss.item() if depthloss is not None else None)
                     row.append(tvloss.item() if tvloss is not None else None)
                     if cfg.enable_exposure_opt:
@@ -1624,6 +1842,15 @@ class Runner:
                     rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+                elif self.cfg.enable_intrinsic_decomp:
+                    # For intrinsic decomposition, combine albedo + illumination with default exposure=1.0
+                    albedo_sh0 = self.splats["albedo_sh0"]
+                    albedo_shN = self.splats["albedo_shN"]
+                    illum_sh0 = self.splats["illum_sh0"]
+                    illum_shN = self.splats["illum_shN"]
+                    # Combine with exposure=1.0 for export
+                    sh0 = albedo_sh0 + illum_sh0 * 1.0
+                    shN = albedo_shN + illum_shN * 1.0
                 else:
                     sh0 = self.splats["sh0"]
                     shN = self.splats["shN"]
