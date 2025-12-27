@@ -1,491 +1,329 @@
-## Core Insight: Learn Scene Properties that Transfer Across Exposures
+# ============================================================================
+# KEY FIXES FOR YOUR TRAINING LOOP
+# ============================================================================
 
-The key is to learn **exposure-invariant scene properties** (geometry, albedo, reflectance) from dark images, then **render at arbitrary exposures**.
+# 1. ENABLE INTRINSIC DECOMPOSITION (you have this disabled!)
+cfg.enable_intrinsic_decomp = True
+cfg.albedo_reg_lambda = 0.01
+cfg.illum_reg_lambda = 0.01
 
----
+# 2. ENABLE SYNTHETIC EXPOSURE GENERATION
+cfg.enable_synthetic_exposures = True
+cfg.num_synthetic_exposures = 5
 
-## 🔥 Advanced Ideas for Low-Light → Well-Lit Transfer
+# 3. FIX THE TRAINING TARGET CREATION
+# In your training loop, BEFORE rendering:
 
-### **1. Intrinsic Decomposition in GS Space**
+# Get curriculum target exposure
+if cfg.curriculum_enabled:
+    target_exposure = get_curriculum_exposure(step, max_steps, cfg.curriculum_max_exposure)
+else:
+    target_exposure = 1.0
 
-Decompose the scene into exposure-invariant and exposure-dependent components:
-
-```python
-class IntrinsicGaussianSplats(torch.nn.Module):
-    """Split Gaussians into albedo (invariant) + illumination (variant)"""
+# Generate synthetic bright target
+if cfg.enable_synthetic_exposures and target_exposure is not None:
+    # CRITICAL: Don't just multiply by exposure, that's still dark!
+    # Instead, use the intrinsic decomposition properly
     
-    def __init__(self, N, sh_degree):
-        super().__init__()
-        # Albedo: Exposure-invariant reflectance (what color is the surface?)
-        self.albedo_sh0 = torch.nn.Parameter(torch.zeros(N, 1, 3))  # Base color
-        self.albedo_shN = torch.nn.Parameter(torch.zeros(N, sh_degree**2-1, 3))  # Reflectance detail
+    # Option A: Train in HDR space (RECOMMENDED)
+    # Convert dark GT to HDR by dividing by a base exposure estimate
+    # Assume dark images were captured at ~1/10 of proper exposure
+    dark_base_exposure = 0.1  # Dark images are 10x underexposed
+    hdr_gt = pixels / dark_base_exposure  # Convert to HDR radiance
+    
+    # Now create synthetic target at target_exposure
+    # The model renders at target_exposure, and we train against HDR GT
+    pixels_target = hdr_gt  # This is the TRUE bright radiance we want
+    
+    # For rendering, we'll use target_exposure in intrinsic decomp
+    # Final render = albedo + illumination * target_exposure
+    # We want: (albedo + illum * target_exposure) ≈ hdr_gt
+    
+    # This encourages:
+    # - albedo to capture exposure-invariant color
+    # - illumination to scale with exposure
+
+else:
+    pixels_target = pixels  # Fallback to dark image
+
+
+# 4. FIX THE RENDERING CALL
+# Pass target_exposure explicitly for intrinsic decomposition
+exposure_value_kwarg = {}
+if cfg.enable_intrinsic_decomp and target_exposure is not None:
+    exposure_value_kwarg["exposure_value"] = torch.tensor(
+        [target_exposure], device=device, dtype=torch.float32
+    )
+
+renders, alphas, info = self.rasterize_splats(
+    camtoworlds=camtoworlds,
+    Ks=Ks,
+    width=width,
+    height=height,
+    sh_degree=sh_degree_to_use,
+    near_plane=cfg.near_plane,
+    far_plane=cfg.far_plane,
+    image_ids=image_ids,
+    render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+    masks=masks,
+    apply_exposure=False,  # DON'T apply learned exposure here!
+    **exposure_value_kwarg,  # Use curriculum exposure instead
+)
+
+
+# 5. FIX THE LOSS COMPUTATION
+# Compare rendered (at target_exposure) against HDR GT
+if cfg.use_nll_loss:
+    loss_nll = poisson_gaussian_nll_loss(colors, pixels_target)
+    loss = loss_nll
+else:
+    l1loss = F.l1_loss(colors, pixels_target)
+    ssimloss = 1.0 - fused_ssim(
+        colors.permute(0, 3, 1, 2), 
+        pixels_target.permute(0, 3, 1, 2), 
+        padding="valid"
+    )
+    loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+
+# 6. ENHANCED RATIO LOSS (Use brightness ratios from GT)
+if cfg.enable_ratio_loss and step % cfg.ratio_loss_freq == 0:
+    # Sample 2 images
+    indices = np.random.choice(len(self.trainset), size=2, replace=False)
+    ratio_data = [self.trainset[int(idx)] for idx in indices]
+    
+    # Get GT brightness ratio
+    img_i_gt = ratio_data[0]["image"].to(device)
+    img_j_gt = ratio_data[1]["image"].to(device)
+    brightness_i = img_i_gt.mean()
+    brightness_j = img_j_gt.mean()
+    gt_brightness_ratio = brightness_i / (brightness_j + 1e-6)
+    
+    # Render both at the SAME target exposure (e.g., target_exposure)
+    radiances = []
+    for rd in ratio_data:
+        c2w = rd["camtoworld"].unsqueeze(0).to(device)
+        K = rd["K"].unsqueeze(0).to(device)
+        h, w = rd["image"].shape[:2]
         
-        # Illumination: Exposure-dependent lighting (how much light hits it?)
-        self.illum_sh0 = torch.nn.Parameter(torch.zeros(N, 1, 3))  # Global light
-        self.illum_shN = torch.nn.Parameter(torch.zeros(N, sh_degree**2-1, 3))  # Local light
-        
-        # Geometry (standard)
-        self.means = torch.nn.Parameter(torch.zeros(N, 3))
-        self.scales = torch.nn.Parameter(torch.zeros(N, 3))
-        self.quats = torch.nn.Parameter(torch.zeros(N, 4))
-        self.opacities = torch.nn.Parameter(torch.zeros(N))
-    
-    def forward(self, exposure: float):
-        # Final color = albedo * illumination * exposure
-        # In SH space: addition (since we're in log space conceptually)
-        colors_sh0 = self.albedo_sh0 + self.illum_sh0 * exposure
-        colors_shN = self.albedo_shN + self.illum_shN * exposure
-        return colors_sh0, colors_shN
-```
-
-**Training:**
-```python
-# During training on low-light images
-colors_sh0, colors_shN = self.splats(exposure=exposure_low)
-rendered = rasterize(colors_sh0, colors_shN, ...)
-loss = nll_loss(rendered, gt_dark)
-
-# Add regularization: albedo should be exposure-invariant
-loss_albedo_reg = self.splats.albedo_sh0.var() * 0.01  # Encourage smooth albedo
-loss_illum_reg = (self.splats.illum_sh0.mean() - torch.log(exposure_low))**2 * 0.1
-
-# At test time: render with high exposure
-colors_sh0, colors_shN = self.splats(exposure=10.0)  # Bright!
-```
-
-**Why this works:** The model learns that albedo is constant, illumination scales with exposure. Dark images provide albedo information, and exposure control provides brightness.
-
----
-
-### **2. Self-Supervised Multi-Exposure Synthesis**
-
-Generate synthetic multi-exposure training data from single low-light images:
-
-```python
-def generate_synthetic_exposures(dark_image, num_exposures=5):
-    """
-    Create training triplets: (dark, mid, bright) from single dark image
-    Key insight: Even if GT is dark, we can create synthetic bright versions
-    and enforce consistency in learned radiance space
-    """
-    exposures = torch.linspace(0.5, 5.0, num_exposures)
-    synthetic_images = []
-    
-    for exp in exposures:
-        # Simple: Just brighten the image
-        synthetic = dark_image * exp
-        # Better: Add noise model (bright images have less relative noise)
-        noise_level = 0.01 / exp  # Less noise in bright images
-        synthetic = synthetic + torch.randn_like(synthetic) * noise_level
-        synthetic_images.append(synthetic)
-    
-    return synthetic_images, exposures
-
-# Training loop
-dark_image = load_image(...)
-synthetic_images, exposures = generate_synthetic_exposures(dark_image)
-
-for syn_img, exp in zip(synthetic_images, exposures):
-    # Render with this exposure
-    rendered = rasterize_splats(..., exposure=exp)
-    # Train to match synthetic
-    loss += nll_loss(rendered, syn_img)
-
-# Critical: Add cross-exposure consistency
-# If I render the same point at 2 exposures, radiance should scale linearly
-radiance_1 = rasterize_splats(..., exposure=1.0, apply_exposure=False)
-radiance_2 = rasterize_splats(..., exposure=2.0, apply_exposure=False)
-loss_consistency = F.l1_loss(radiance_1 * 2.0, radiance_2)
-```
-
-**Insight:** You're teaching the model "this is what the scene looks like at different exposures" even though you only have one dark capture.
-
----
-
-### **3. Physics-Based Radiance Clues**
-
-Even in dark images, there are physics clues about true radiance:
-
-```python
-def extract_radiance_priors(dark_image):
-    """
-    Extract high-confidence radiance estimates from dark images
-    """
-    # 1. Specular highlights (even in dark images, these are clipped)
-    # These tell us about maximum radiance
-    specular_mask = (dark_image > 0.9).any(dim=-1)  # Saturated pixels
-    
-    # 2. Shadow/non-shadow ratios (geometry is exposure-invariant)
-    # If region A is 2x brighter than region B in dark image,
-    # this ratio should hold in bright image
-    
-    # 3. Color constancy (ratios between RGB channels)
-    rgb_ratios = dark_image / (dark_image.mean(dim=-1, keepdim=True) + 1e-6)
-    
-    return {
-        'specular_mask': specular_mask,
-        'rgb_ratios': rgb_ratios,
-    }
-
-# Use in loss
-priors = extract_radiance_priors(gt_dark)
-
-# Loss: RGB ratios should match even at different exposures
-rendered_ratios = rendered / (rendered.mean(dim=-1, keepdim=True) + 1e-6)
-loss_color_const = F.l1_loss(rendered_ratios, priors['rgb_ratios'])
-
-# Loss: Specular regions should be bright in radiance space
-radiance = rendered / exposure
-loss_specular = (1.0 - radiance[priors['specular_mask']]).mean()
-```
-
----
-
-### **4. Ratio-Based Supervision (Upgraded)**
-
-Your ratio loss is close, but make it smarter:
-
-```python
-def compute_smart_ratio_loss(splats, trainset):
-    """
-    Use relative brightness between images to supervise absolute radiance
-    """
-    # Sample 2 images with different brightness
-    img1_data = trainset[random.randint(0, len(trainset)-1)]
-    img2_data = trainset[random.randint(0, len(trainset)-1)]
-    
-    # Compute mean brightness ratio (this is ground truth)
-    brightness_1 = img1_data['image'].mean()
-    brightness_2 = img2_data['image'].mean()
-    gt_ratio = brightness_1 / (brightness_2 + 1e-6)
-    
-    # Render both
-    R1 = rasterize_splats(..., apply_exposure=False)  # Raw radiance
-    R2 = rasterize_splats(..., apply_exposure=False)
-    
-    # Get learned exposures
-    exp1 = exposure_module(img1_data['image_id'])
-    exp2 = exposure_module(img2_data['image_id'])
-    
-    # The ratio of exposures should match brightness ratio
-    learned_ratio = exp1 / (exp2 + 1e-6)
-    
-    loss_ratio = F.l1_loss(learned_ratio, gt_ratio)
-    
-    # Additionally: HDR radiance should be similar after exposure correction
-    I1 = R1 / exp1  # HDR reconstruction
-    I2 = R2 / exp2
-    loss_hdr_consistency = F.l1_loss(I1, I2.detach())  # One-way
-    
-    return loss_ratio + 0.1 * loss_hdr_consistency
-```
-
-**Key insight:** The brightness ratios between images tell you about relative exposures!
-
----
-
-### **5. Adversarial Exposure Training**
-
-Train a discriminator to distinguish "real bright images" from "rendered bright images":
-
-```python
-class BrightnessDiscriminator(torch.nn.Module):
-    """Discriminator that judges if an image looks naturally well-lit"""
-    def __init__(self):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 64, 4, 2, 1),
-            torch.nn.LeakyReLU(0.2),
-            torch.nn.Conv2d(64, 128, 4, 2, 1),
-            torch.nn.LeakyReLU(0.2),
-            torch.nn.Conv2d(128, 1, 4, 1, 0),
+        # Render at fixed exposure
+        rad, _, _ = self.rasterize_splats(
+            camtoworlds=c2w,
+            Ks=K,
+            width=w,
+            height=h,
+            sh_degree=sh_degree_to_use,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            apply_exposure=False,
+            exposure_value=torch.tensor([target_exposure], device=device),
         )
+        radiances.append(rad[..., 0:3])
     
-    def forward(self, x):
-        return self.net(x.permute(0, 3, 1, 2)).mean()
-
-# Training
-discriminator = BrightnessDiscriminator()
-
-# Render at high exposure
-rendered_bright = rasterize(..., exposure=10.0)
-
-# Get "fake" bright images from synthetic data or other dataset
-real_bright = load_welllit_images(...)  # From different dataset!
-
-# GAN loss
-D_real = discriminator(real_bright)
-D_fake = discriminator(rendered_bright)
-
-loss_gan = -torch.log(D_fake + 1e-8)  # Fool the discriminator
-loss_disc = -torch.log(D_real + 1e-8) - torch.log(1 - D_fake + 1e-8)
-
-# Combined
-loss_total = loss_recon + 0.1 * loss_gan
-```
-
-**Insight:** You're learning "what do well-lit images look like" from external data, even though your 3D data is dark.
-
----
-
-### **6. Curriculum Learning: Dark → Bright Gradually**
-
-Don't jump from dark to bright immediately. Gradually increase target exposure:
-
-```python
-def get_curriculum_exposure(step, max_steps):
-    """Start by reconstructing dark, gradually target brighter"""
-    progress = step / max_steps
+    # HDR radiances should have the SAME brightness ratio as GT
+    R_i, R_j = radiances[0], radiances[1]
+    rendered_brightness_i = R_i.mean()
+    rendered_brightness_j = R_j.mean()
+    rendered_ratio = rendered_brightness_i / (rendered_brightness_j + 1e-6)
     
-    # Phase 1 (0-30%): Reconstruct dark images (exposure ~1.0)
-    # Phase 2 (30-70%): Gradually increase (exposure 1.0 → 5.0)
-    # Phase 3 (70-100%): Target bright images (exposure 5.0 → 10.0)
+    # Ratio loss: rendered ratio should match GT ratio
+    loss_ratio = F.l1_loss(rendered_ratio, gt_brightness_ratio)
+    loss += cfg.ratio_lambda * loss_ratio
+
+
+# 7. ADDITIONAL LOSS: Exposure Diversity (force learned exposures to diverge)
+if cfg.enable_exposure_opt:
+    # Even though we're not using learned exposures for training,
+    # we still optimize them to match GT brightness
+    # This helps at test time when we don't have curriculum
     
-    if progress < 0.3:
-        return 1.0
-    elif progress < 0.7:
-        return 1.0 + (progress - 0.3) / 0.4 * 4.0  # 1.0 → 5.0
+    if world_size > 1:
+        learned_exposures = self.exposure_module.module.exposures
     else:
-        return 5.0 + (progress - 0.7) / 0.3 * 5.0  # 5.0 → 10.0
-
-# Training
-target_exposure = get_curriculum_exposure(step, max_steps)
-rendered = rasterize(..., exposure=target_exposure)
-
-# Generate synthetic target at this exposure
-synthetic_target = gt_dark * target_exposure
-loss = nll_loss(rendered, synthetic_target)
-```
-
-**Why:** The model learns gradual brightness changes, not a sudden jump.
-
----
-
-### **7. Albedo Smoothness + Illumination Sparsity**
-
-Encourage the right decomposition through priors:
-
-```python
-# Albedo should be spatially smooth (surfaces have coherent colors)
-def spatial_smoothness_loss(albedo_map):
-    """Encourage nearby pixels to have similar albedo"""
-    dy = albedo_map[:, 1:, :, :] - albedo_map[:, :-1, :, :]
-    dx = albedo_map[:, :, 1:, :] - albedo_map[:, :, :-1, :]
-    return (dy.abs().mean() + dx.abs().mean())
-
-# Illumination should be sparse (most light comes from few directions)
-def sparsity_loss(illumination_sh):
-    """Encourage illumination to be sparse in SH basis"""
-    return torch.abs(illumination_sh).mean()
-
-# In training
-albedo_sh0, albedo_shN = self.splats.albedo_sh0, self.splats.albedo_shN
-illum_sh0, illum_shN = self.splats.illum_sh0, self.splats.illum_shN
-
-# Render albedo map (for visualization and regularization)
-albedo_map = rasterize(albedo_sh0, albedo_shN, ...)
-
-loss_smooth = spatial_smoothness_loss(albedo_map) * 0.01
-loss_sparse = sparsity_loss(illum_shN) * 0.01
-loss += loss_smooth + loss_sparse
-```
-
----
-
-### **8. Test-Time Refinement with Bright Images**
-
-If you get ANY bright images (even 1-2), use them for test-time adaptation:
-
-```python
-# During test time, if you have a bright image
-def test_time_refinement(splats, bright_image, num_steps=100):
-    """Fine-tune on a single bright image to calibrate exposure"""
+        learned_exposures = self.exposure_module.exposures
     
-    # Clone current model
-    splats_test = copy.deepcopy(splats)
-    optimizer = torch.optim.Adam(splats_test.parameters(), lr=1e-4)
+    # Encourage diversity: exposures shouldn't all be 1.0
+    exp_std = learned_exposures.std()
+    loss_exp_diversity = -0.1 * exp_std  # Negative because we want HIGH std
+    loss += loss_exp_diversity
     
-    for _ in range(num_steps):
-        rendered = rasterize(splats_test, exposure=10.0)
-        loss = F.l1_loss(rendered, bright_image)
-        loss.backward()
-        optimizer.step()
+    # Also encourage learned exposures to match image brightness
+    # For current batch, learned exposure should be ~1/brightness
+    batch_brightness = pixels.mean()
+    learned_exp_batch = learned_exposures[image_ids].mean()
+    target_exp = 1.0 / (batch_brightness + 1e-3)  # Bright images need low exp
+    loss_exp_align = F.l1_loss(learned_exp_batch, target_exp)
+    loss += 0.01 * loss_exp_align
+
+
+# ============================================================================
+# ALTERNATIVE APPROACH: Multi-Exposure Supervision (Simpler)
+# ============================================================================
+
+# If intrinsic decomposition is too complex, try this simpler approach:
+
+if cfg.enable_synthetic_exposures:
+    # Generate multiple exposures from the dark image
+    synthetic_images, exposure_levels = generate_synthetic_exposures(
+        pixels, 
+        num_exposures=3,  # dark, mid, bright
+        min_exposure=1.0,
+        max_exposure=target_exposure
+    )
     
-    return splats_test
-
-# Use this refined model for final rendering
-```
-
----
-
-### **9. Pretrain on Synthetic Data**
-
-Use synthetic bright+dark pairs to pretrain:
-
-```python
-# Generate synthetic low-light data from well-lit datasets
-def create_synthetic_lowlight(bright_image):
-    """Simulate low-light capture"""
-    # Reduce exposure
-    dark_image = bright_image / 10.0
-    # Add realistic noise
-    noise = torch.randn_like(dark_image) * 0.05
-    dark_image = dark_image + noise
-    return dark_image
-
-# Pretrain on synthetic pairs
-bright_gt = load_welllit_dataset()
-dark_synthetic = create_synthetic_lowlight(bright_gt)
-
-# Train with paired supervision
-rendered_dark = rasterize(..., exposure=1.0)
-rendered_bright = rasterize(..., exposure=10.0)
-
-loss = nll_loss(rendered_dark, dark_synthetic) + nll_loss(rendered_bright, bright_gt)
-
-# Then fine-tune on real LOM dark images
-```
-
----
-
-### **10. Exposure as a Latent Variable (VAE-Style)**
-
-Treat exposure as a latent variable you want to infer:
-
-```python
-class ExposureVAE(torch.nn.Module):
-    """Learn a distribution over exposures"""
-    def __init__(self, n_images):
-        super().__init__()
-        self.exposure_mean = torch.nn.Parameter(torch.ones(n_images))
-        self.exposure_logvar = torch.nn.Parameter(torch.zeros(n_images))
-    
-    def forward(self, image_ids, sample=True):
-        mean = self.exposure_mean[image_ids]
-        logvar = self.exposure_logvar[image_ids]
+    # Render at multiple exposures and supervise each
+    total_loss = 0.0
+    for syn_img, exp_level in zip(synthetic_images, exposure_levels):
+        # Render at this exposure level
+        renders, _, _ = self.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=sh_degree_to_use,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            apply_exposure=False,
+            exposure_value=torch.tensor([exp_level], device=device),
+        )
         
-        if sample:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mean + eps * std
+        # Loss for this exposure level
+        if cfg.use_nll_loss:
+            total_loss += poisson_gaussian_nll_loss(renders, syn_img)
         else:
-            return mean
+            total_loss += F.l1_loss(renders, syn_img)
     
-    def kl_divergence(self, image_ids):
-        """KL divergence with prior p(exposure) = LogNormal(0, 1)"""
-        mean = self.exposure_mean[image_ids]
-        logvar = self.exposure_logvar[image_ids]
-        return -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+    loss = total_loss / len(synthetic_images)
 
-# Training
-exposure = exposure_vae(image_ids, sample=True)
-rendered = rasterize(..., exposure=exposure)
-loss_recon = nll_loss(rendered, gt_dark)
-loss_kl = exposure_vae.kl_divergence(image_ids) * 0.01
-loss = loss_recon + loss_kl
-```
 
-**Why:** Uncertainty in exposure is explicitly modeled. At test time, you sample or use the mean.
+# ============================================================================
+# CRITICAL DEBUG LOGGING
+# ============================================================================
 
----
-
-### **11. Depth-Guided Lighting Separation**
-
-Use depth to separate ambient vs direct lighting:
-
-```python
-# Objects further away receive more ambient light, less direct
-def depth_aware_lighting(depth_map, ambient_coeff, direct_coeff):
-    """
-    Ambient: Uniform, exposure-invariant background light
-    Direct: Distance-dependent, exposure-dependent spotlight
-    """
-    ambient = ambient_coeff * torch.ones_like(depth_map)
-    direct = direct_coeff * torch.exp(-depth_map / depth_scale)
+# Add this to your tensorboard logging to understand what's happening:
+if world_rank == 0 and step % cfg.tb_every == 0:
+    # Log actual image brightness
+    self.writer.add_scalar("debug/gt_brightness_mean", pixels.mean().item(), step)
+    self.writer.add_scalar("debug/gt_brightness_max", pixels.max().item(), step)
     
-    return ambient + direct
-
-# In rasterization, compute per-pixel depth
-depth = render_depth(...)
-lighting = depth_aware_lighting(depth, self.ambient, self.direct)
-
-# Final color = albedo * lighting * exposure
-colors = albedo * lighting * exposure
-```
-
----
-
-### **12. Cross-Dataset Transfer Learning**
-
-Use well-lit datasets to learn "what brightness looks like":
-
-```python
-# Step 1: Train a "brightness prior" on well-lit datasets (e.g., Mip-NeRF360)
-brightness_encoder = train_on_bright_dataset()  # Learns brightness statistics
-
-# Step 2: Use this prior when training on LOM
-def brightness_prior_loss(rendered_bright, brightness_encoder):
-    """Ensure rendered bright image matches statistics of real bright images"""
-    rendered_features = brightness_encoder(rendered_bright)
-    # Match mean and variance of features
-    loss = (rendered_features.mean() - bright_mean)**2
-    loss += (rendered_features.std() - bright_std)**2
-    return loss
-
-# Training on LOM
-rendered = rasterize(..., exposure=10.0)
-loss_prior = brightness_prior_loss(rendered, brightness_encoder)
-loss += 0.1 * loss_prior
-```
-
----
-
-## 🎯 Recommended Strategy: Combine Ideas #1, #2, #4, #6
-
-Here's my recommended pipeline:
-
-```python
-# 1. Intrinsic Decomposition (Idea #1)
-splats = IntrinsicGaussianSplats(...)
-
-# 2. Multi-Exposure Synthesis (Idea #2)
-synthetic_exposures = generate_synthetic_exposures(dark_image, num=5)
-
-# 3. Curriculum Learning (Idea #6)
-target_exposure = get_curriculum_exposure(step, max_steps)
-
-# 4. Ratio Supervision (Idea #4)
-loss_ratio = compute_smart_ratio_loss(splats, trainset)
-
-# Combined Training Loop
-for step in range(max_steps):
-    # Get dark GT
-    dark_gt = load_dark_image(...)
+    # Log rendered brightness
+    self.writer.add_scalar("debug/rendered_brightness_mean", colors.mean().item(), step)
+    self.writer.add_scalar("debug/rendered_brightness_max", colors.max().item(), step)
     
-    # Generate synthetic bright target
-    target_exp = get_curriculum_exposure(step, max_steps)
-    bright_target = dark_gt * target_exp
+    # Log target brightness
+    self.writer.add_scalar("debug/target_brightness_mean", pixels_target.mean().item(), step)
     
-    # Render with intrinsic decomposition
-    colors_sh0, colors_shN = splats(exposure=target_exp)
-    rendered = rasterize(colors_sh0, colors_shN, ...)
+    # Log curriculum vs learned exposure
+    if cfg.curriculum_enabled:
+        self.writer.add_scalar("debug/curriculum_exposure", target_exposure, step)
+    if cfg.enable_exposure_opt:
+        learned_exp = (self.exposure_module.module if world_size > 1 
+                      else self.exposure_module).exposures[image_ids].mean()
+        self.writer.add_scalar("debug/learned_exposure", learned_exp.item(), step)
     
-    # Multi-task loss
-    loss_recon = nll_loss(rendered, bright_target)
-    loss_ratio = compute_smart_ratio_loss(splats, trainset)
-    loss_albedo_reg = splats.albedo_sh0.var() * 0.01
-    loss_illum_sparse = splats.illum_shN.abs().mean() * 0.01
+    # Log intrinsic components (if enabled)
+    if cfg.enable_intrinsic_decomp:
+        albedo_mean = self.splats["albedo_sh0"].abs().mean().item()
+        illum_mean = self.splats["illum_sh0"].abs().mean().item()
+        self.writer.add_scalar("debug/albedo_magnitude", albedo_mean, step)
+        self.writer.add_scalar("debug/illumination_magnitude", illum_mean, step)
+
+
+# ============================================================================
+# UPDATED CONFIG RECOMMENDATIONS
+# ============================================================================
+
+# Use these settings for best results:
+Config(
+    # Core HDR settings
+    enable_intrinsic_decomp=True,  # ENABLE THIS!
+    albedo_reg_lambda=0.01,
+    illum_reg_lambda=0.01,
     
-    loss = loss_recon + 0.1*loss_ratio + loss_albedo_reg + loss_illum_sparse
-    loss.backward()
-```
+    # Multi-exposure synthesis
+    enable_synthetic_exposures=True,
+    num_synthetic_exposures=3,
+    
+    # Curriculum learning
+    curriculum_enabled=True,
+    curriculum_max_exposure=10.0,
+    
+    # Exposure optimization (keep enabled for test time)
+    enable_exposure_opt=True,
+    exposure_lr=1e-3,
+    
+    # Loss configuration
+    use_nll_loss=True,
+    ratio_lambda=0.1,
+    sh_reg_lambda=0.01,
+    
+    # Prevent GS collapse
+    strategy=MCMCStrategy(verbose=True),  # Use MCMC, not DefaultStrategy
+    init_opa=0.5,
+    init_scale=0.1,
+    opacity_reg=0.01,
+    scale_reg=0.01,
+    min_gs_count=100,  # Lower threshold
+    min_opacity_threshold=0.005,  # Higher threshold
+    enable_opacity_clamping=True,
+)
 
----
 
-## Key Takeaway
+# ============================================================================
+# WHY THIS WORKS
+# ============================================================================
 
-**The fundamental trick:** You need to give the model **inductive biases** about what "brightness" means, since you don't have bright GT. These biases come from:
-1. **Physics:** Albedo is exposure-invariant, illumination scales linearly
-2. **Synthetic data:** Brighten dark images yourself as pseudo-GT
-3. **Cross-image consistency:** Brightness ratios provide relative exposure info
-4. **External priors:** Use statistics from well-lit datasets
+"""
+The key insight: You need to decouple THREE things that you're currently conflating:
+
+1. **Curriculum target exposure** (what exposure we render at during training)
+   - Increases from 1.0 → 10.0 over training
+   - Used in intrinsic decomposition: colors = albedo + illum * target_exposure
+
+2. **Learned per-image exposures** (what the model thinks each image's exposure was)
+   - Optimized to match GT brightness ratios
+   - Used at test time when we don't have curriculum
+
+3. **GT HDR radiance** (what we supervise against)
+   - Derived from dark images by estimating their underexposure
+   - Represents the "true" scene radiance
+
+Current problem:
+- You render at target_exposure=10.0
+- But supervise against dark GT (brightness ~0.05)
+- Model learns: "to match dark GT at exposure=10, I need to output ~0.05/10 = 0.005 radiance"
+- This means learned exposures stay ~1.0 and model stores dark radiance
+
+Solution:
+- Render at target_exposure=10.0
+- Supervise against hdr_gt = dark_gt / 0.1 (assuming 10x underexposure)
+- Model learns: "to match bright GT at exposure=10, I need to output bright radiance"
+- Now illumination scales correctly with exposure
+- At test time, render at any exposure and get corresponding brightness
+"""
+
+
+# ============================================================================
+# QUICK TEST: Verify Your Setup
+# ============================================================================
+
+# Add this to your training loop to verify the setup is correct:
+if step == 0 and world_rank == 0:
+    print("=== TRAINING SETUP VERIFICATION ===")
+    print(f"GT image brightness: {pixels.mean().item():.6f}")
+    print(f"Target exposure: {target_exposure}")
+    print(f"Target brightness: {pixels_target.mean().item():.6f}")
+    print(f"Ratio: {pixels_target.mean().item() / pixels.mean().item():.2f}")
+    print(f"Expected ratio: {target_exposure:.2f}")
+    
+    if cfg.enable_intrinsic_decomp:
+        print("✓ Intrinsic decomposition ENABLED")
+    else:
+        print("✗ Intrinsic decomposition DISABLED - THIS IS THE PROBLEM!")
+    
+    if cfg.enable_synthetic_exposures:
+        print("✓ Synthetic exposures ENABLED")
+    else:
+        print("✗ Synthetic exposures DISABLED")
+    
+    print("===================================")

@@ -860,12 +860,12 @@ class Config:
     # Recommended Strategy Parameters (Ideas #1, #2, #4, #6)
     # ========================================================================
     # Intrinsic decomposition (Idea #1)
-    enable_intrinsic_decomp: bool = False
+    enable_intrinsic_decomp: bool = True
     albedo_reg_lambda: float = 0.01
     illum_reg_lambda: float = 0.01
     
     # Multi-exposure synthesis (Idea #2)
-    enable_synthetic_exposures: bool = False
+    enable_synthetic_exposures: bool = True
     num_synthetic_exposures: int = 5
     
     # Curriculum learning (Idea #6)
@@ -877,10 +877,10 @@ class Config:
     # ========================================================================
     # Minimum opacity threshold (lower than default 0.005 to prevent aggressive pruning)
     min_opacity_threshold: float = 0.001
-    # Stop pruning if GS count drops below this value
-    min_gs_count: int = 1000
+    # Stop pruning if GS count drops below this value (increased to prevent collapse)
+    min_gs_count: int = 500
     # How many steps to pause pruning when GS count is low
-    pruning_protection_steps: int = 500
+    pruning_protection_steps: int = 1000
     # Enable opacity clamping to prevent opacities from going to zero
     enable_opacity_clamping: bool = True
 
@@ -968,7 +968,8 @@ def create_splats_with_optimizers(
         if enable_intrinsic_decomp:
             # Intrinsic decomposition: Split into albedo (invariant) + illumination (variant)
             # Albedo: Exposure-invariant reflectance (what color is the surface?)
-            albedo_sh0 = rgb_to_sh(rgbs)  # Initialize from RGB [N, 1, 3]
+            albedo_sh0_raw = rgb_to_sh(rgbs)  # Returns [N, 3]
+            albedo_sh0 = albedo_sh0_raw.unsqueeze(1)  # Reshape to [N, 1, 3]
             # Higher-order SH: (sh_degree + 1)^2 - 1 coefficients (excluding sh0)
             num_sh_coeffs = (sh_degree + 1) ** 2 - 1
             albedo_shN = torch.zeros((N, num_sh_coeffs, 3))  # Higher-order SH for albedo
@@ -1461,18 +1462,57 @@ class Runner:
             if cfg.curriculum_enabled:
                 target_exposure = get_curriculum_exposure(step, max_steps, cfg.curriculum_max_exposure)
             else:
-                target_exposure = None  # Explicitly set to None if disabled
+                target_exposure = 1.0 if cfg.enable_synthetic_exposures else None
             
             # Multi-exposure synthesis: Generate synthetic bright target if enabled
+            # CRITICAL: Convert dark GT to HDR space (don't just multiply by exposure)
             pixels_target = pixels  # Default to original dark image
             if cfg.enable_synthetic_exposures and target_exposure is not None:
-                # Generate synthetic bright target
-                pixels_target = pixels * target_exposure
-                # Add noise model (less noise in bright images)
-                noise_level = 0.01 / target_exposure
-                noise = torch.randn_like(pixels_target) * noise_level
-                pixels_target = pixels_target + noise
-                pixels_target = torch.clamp(pixels_target, 0.0, 1.0)
+                # Option A: Train in HDR space (RECOMMENDED)
+                # Convert dark GT to HDR by dividing by a base exposure estimate
+                # Assume dark images were captured at ~1/10 of proper exposure
+                dark_base_exposure = 0.1  # Dark images are 10x underexposed
+                hdr_gt = pixels / dark_base_exposure  # Convert to HDR radiance
+                
+                # Scale HDR target by curriculum progress to avoid extreme mismatches early in training
+                # At low exposures, use a softer target to prevent aggressive pruning
+                # At high exposures, use full HDR target
+                curriculum_progress = min(target_exposure / cfg.curriculum_max_exposure, 1.0) if cfg.curriculum_enabled else 1.0
+                # Blend between original pixels and full HDR based on curriculum progress
+                # This prevents huge losses at the start when exposure is low
+                pixels_target = pixels * (1.0 - curriculum_progress) + hdr_gt * curriculum_progress
+                
+                # For rendering, we'll use target_exposure in intrinsic decomp
+                # Final render = albedo + illumination * target_exposure
+                # We want: (albedo + illum * target_exposure) ≈ pixels_target
+                
+                # This encourages:
+                # - albedo to capture exposure-invariant color
+                # - illumination to scale with exposure
+                # - Gradual learning as curriculum exposure increases
+
+            # Quick test: Verify setup at step 0
+            if step == 0 and world_rank == 0:
+                print("=== TRAINING SETUP VERIFICATION ===")
+                print(f"GT image brightness: {pixels.mean().item():.6f}")
+                print(f"Target exposure: {target_exposure}")
+                print(f"Target brightness: {pixels_target.mean().item():.6f}")
+                if pixels.mean().item() > 0:
+                    print(f"Ratio: {pixels_target.mean().item() / pixels.mean().item():.2f}")
+                if target_exposure is not None:
+                    print(f"Expected ratio: {target_exposure:.2f}")
+                
+                if cfg.enable_intrinsic_decomp:
+                    print("✓ Intrinsic decomposition ENABLED")
+                else:
+                    print("✗ Intrinsic decomposition DISABLED - THIS IS THE PROBLEM!")
+                
+                if cfg.enable_synthetic_exposures:
+                    print("✓ Synthetic exposures ENABLED")
+                else:
+                    print("✗ Synthetic exposures DISABLED")
+                
+                print("===================================")
 
             # forward
             # For intrinsic decomposition with curriculum, pass exposure_value
@@ -1481,6 +1521,10 @@ class Runner:
                 exposure_value_kwarg["exposure_value"] = torch.tensor(
                     [target_exposure], device=device, dtype=torch.float32
                 )
+            
+            # DON'T apply learned exposure when using intrinsic decomposition with curriculum
+            # The exposure is already applied via exposure_value parameter in intrinsic decomposition
+            apply_exposure_flag = not (cfg.enable_intrinsic_decomp and target_exposure is not None)
             
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -1493,7 +1537,7 @@ class Runner:
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
-                apply_exposure=True,  # Apply exposure during training
+                apply_exposure=apply_exposure_flag,  # False when using intrinsic decomp with curriculum
                 **exposure_value_kwarg,
             )
             if renders.shape[-1] == 4:
@@ -1573,7 +1617,7 @@ class Runner:
                 )
                 loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
-            # Exposure ratio loss (HDR consistency)
+            # Enhanced ratio loss (HDR consistency): Use brightness ratios from GT
             # Note: Ratio loss is computationally expensive, so we compute it less frequently
             if cfg.enable_ratio_loss and step % cfg.ratio_loss_freq == 0 and len(self.trainset) >= 2:
                 try:
@@ -1581,72 +1625,52 @@ class Runner:
                     indices = np.random.choice(len(self.trainset), size=2, replace=False)
                     ratio_data = [self.trainset[int(idx)] for idx in indices]
                     
-                    # Render raw radiance (without exposure) for both cameras
+                    # Get GT brightness ratio (this is ground truth)
+                    img_i_gt = ratio_data[0]["image"].to(device)
+                    img_j_gt = ratio_data[1]["image"].to(device)
+                    brightness_i = img_i_gt.mean()
+                    brightness_j = img_j_gt.mean()
+                    gt_brightness_ratio = brightness_i / (brightness_j + 1e-6)
+                    
+                    # Render both at the SAME target exposure (e.g., target_exposure)
+                    # Use current target_exposure or default to 1.0 if curriculum is disabled
+                    ratio_target_exposure = target_exposure if target_exposure is not None else 1.0
+                    
                     radiances = []
-                    exposures_list = []
                     for rd in ratio_data:
                         c2w = rd["camtoworld"].unsqueeze(0).to(device)
                         K = rd["K"].unsqueeze(0).to(device)
-                        img_id = torch.tensor([rd["image_id"]], device=device)
                         h, w = rd["image"].shape[:2]
+                        
+                        # Render at fixed exposure
+                        exposure_kwarg = {}
+                        if cfg.enable_intrinsic_decomp:
+                            exposure_kwarg["exposure_value"] = torch.tensor(
+                                [ratio_target_exposure], device=device, dtype=torch.float32
+                            )
                         
                         rad, _, _ = self.rasterize_splats(
                             camtoworlds=c2w,
                             Ks=K,
                             width=w,
                             height=h,
-                            image_ids=img_id,
                             sh_degree=sh_degree_to_use,
                             near_plane=cfg.near_plane,
                             far_plane=cfg.far_plane,
-                            apply_exposure=False,  # Raw radiance
+                            apply_exposure=False,  # Exposure handled via exposure_value if intrinsic decomp
+                            **exposure_kwarg,
                         )
                         radiances.append(rad[..., 0:3])
-                        
-                        if cfg.enable_exposure_opt:
-                            if world_size > 1:
-                                exp = self.exposure_module.module(img_id)
-                            else:
-                                exp = self.exposure_module(img_id)
-                            exposures_list.append(exp)
                     
-                    if len(radiances) == 2 and len(exposures_list) == 2:
-                        R_i, R_j = radiances[0], radiances[1]
-                        exp_i, exp_j = exposures_list[0], exposures_list[1]
-                        
-                        # Enhanced ratio loss (Idea #4): Use brightness ratios from GT
-                        # Compute GT brightness ratio (this is ground truth)
-                        img_i_gt = ratio_data[0]["image"].to(device)
-                        img_j_gt = ratio_data[1]["image"].to(device)
-                        brightness_i = img_i_gt.mean()
-                        brightness_j = img_j_gt.mean()
-                        gt_ratio = brightness_i / (brightness_j + 1e-6)
-                        
-                        # Compute learned exposure ratio
-                        learned_ratio = exp_i / (exp_j + 1e-6)
-                        
-                        # Ratio loss: exposure ratios should match brightness ratios
-                        loss_ratio_exp = F.l1_loss(learned_ratio, gt_ratio)
-                        
-                        # HDR consistency: Normalize radiances by exposure
-                        I_i = R_i / (exp_i.view(-1, 1, 1, 1) + 1e-8)
-                        I_j = R_j / (exp_j.view(-1, 1, 1, 1) + 1e-8)
-                        
-                        # Resize to same size if needed
-                        if I_i.shape != I_j.shape:
-                            I_j = F.interpolate(
-                                I_j.permute(0, 3, 1, 2),
-                                size=I_i.shape[1:3],
-                                mode="bilinear",
-                                align_corners=False
-                            ).permute(0, 2, 3, 1)
-                        
-                        # HDR consistency loss: HDR radiance should be similar after exposure correction
-                        loss_hdr_consistency = F.l1_loss(I_i, I_j.detach())
-                        
-                        # Combined ratio loss
-                        loss_ratio = loss_ratio_exp + 0.1 * loss_hdr_consistency
-                        loss += cfg.ratio_lambda * loss_ratio
+                    # HDR radiances should have the SAME brightness ratio as GT
+                    R_i, R_j = radiances[0], radiances[1]
+                    rendered_brightness_i = R_i.mean()
+                    rendered_brightness_j = R_j.mean()
+                    rendered_ratio = rendered_brightness_i / (rendered_brightness_j + 1e-6)
+                    
+                    # Ratio loss: rendered ratio should match GT ratio
+                    loss_ratio = F.l1_loss(rendered_ratio, gt_brightness_ratio)
+                    loss += cfg.ratio_lambda * loss_ratio
                 except Exception as e:
                     # Skip ratio loss if there's an error (e.g., different image sizes)
                     if world_rank == 0:
@@ -1672,6 +1696,28 @@ class Runner:
                 if cfg.illum_reg_lambda > 0:
                     loss_illum_sparse = self.splats["illum_shN"].abs().mean() * cfg.illum_reg_lambda
                     loss += loss_illum_sparse
+
+            # Additional loss: Exposure Diversity (force learned exposures to diverge)
+            # Even though we're not using learned exposures for training with intrinsic decomposition,
+            # we still optimize them to match GT brightness for test time when we don't have curriculum
+            if cfg.enable_exposure_opt:
+                if world_size > 1:
+                    learned_exposures = self.exposure_module.module.exposures
+                else:
+                    learned_exposures = self.exposure_module.exposures
+                
+                # Encourage diversity: exposures shouldn't all be 1.0
+                exp_std = learned_exposures.std()
+                loss_exp_diversity = -0.1 * exp_std  # Negative because we want HIGH std
+                loss += loss_exp_diversity
+                
+                # Also encourage learned exposures to match image brightness
+                # For current batch, learned exposure should be ~1/brightness
+                batch_brightness = pixels.mean()
+                learned_exp_batch = learned_exposures[image_ids].mean()
+                target_exp = 1.0 / (batch_brightness + 1e-3)  # Bright images need low exp
+                loss_exp_align = F.l1_loss(learned_exp_batch, target_exp)
+                loss += 0.01 * loss_exp_align
 
             if cfg.depth_loss:
                 # query depths from depth map
@@ -1752,6 +1798,34 @@ class Runner:
                         self.writer.add_scalar("train/illum_sparse", loss_illum_sparse.item(), step)
                 if cfg.curriculum_enabled and target_exposure is not None:
                     self.writer.add_scalar("train/curriculum_exposure", target_exposure, step)
+                
+                # Critical debug logging to understand what's happening
+                # Log actual image brightness
+                self.writer.add_scalar("debug/gt_brightness_mean", pixels.mean().item(), step)
+                self.writer.add_scalar("debug/gt_brightness_max", pixels.max().item(), step)
+                
+                # Log rendered brightness
+                self.writer.add_scalar("debug/rendered_brightness_mean", colors.mean().item(), step)
+                self.writer.add_scalar("debug/rendered_brightness_max", colors.max().item(), step)
+                
+                # Log target brightness
+                self.writer.add_scalar("debug/target_brightness_mean", pixels_target.mean().item(), step)
+                
+                # Log curriculum vs learned exposure
+                if cfg.curriculum_enabled:
+                    self.writer.add_scalar("debug/curriculum_exposure", target_exposure, step)
+                if cfg.enable_exposure_opt:
+                    learned_exp = (self.exposure_module.module if world_size > 1 
+                                  else self.exposure_module).exposures[image_ids].mean()
+                    self.writer.add_scalar("debug/learned_exposure", learned_exp.item(), step)
+                
+                # Log intrinsic components (if enabled)
+                if cfg.enable_intrinsic_decomp:
+                    albedo_mean = self.splats["albedo_sh0"].abs().mean().item()
+                    illum_mean = self.splats["illum_sh0"].abs().mean().item()
+                    self.writer.add_scalar("debug/albedo_magnitude", albedo_mean, step)
+                    self.writer.add_scalar("debug/illumination_magnitude", illum_mean, step)
+                
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
@@ -1924,26 +1998,53 @@ class Runner:
                     opacities_sigmoid = torch.clamp(opacities_sigmoid, min=cfg.min_opacity_threshold)
                     self.splats["opacities"].data = torch.logit(opacities_sigmoid)
 
-            # Track GS count and implement pruning protection
-            num_gs = len(self.splats["means"])
-            if num_gs < self.min_gs_count_reached:
-                self.min_gs_count_reached = num_gs
+            # Track GS count BEFORE pruning to prevent collapse
+            num_gs_before = len(self.splats["means"])
+            
+            # CRITICAL: Prevent GS count from reaching 0 (causes SIGFPE)
+            if num_gs_before == 0:
                 if world_rank == 0:
-                    print(f"Warning: GS count dropped to {num_gs} at step {step}")
+                    print(f"ERROR: GS count reached 0 at step {step}. Stopping training to prevent crash.")
+                raise RuntimeError(f"GS count reached 0 at step {step}. This indicates aggressive pruning. "
+                                 f"Consider: increasing min_gs_count, reducing learning rates, or adjusting HDR target scaling.")
+            
+            if num_gs_before < self.min_gs_count_reached:
+                self.min_gs_count_reached = num_gs_before
+                if world_rank == 0:
+                    print(f"Warning: GS count dropped to {num_gs_before} at step {step}")
             
             # Activate pruning protection if GS count is too low
-            if num_gs < cfg.min_gs_count:
+            if num_gs_before < cfg.min_gs_count:
                 if self.pruning_protection_active_until < step:
                     self.pruning_protection_active_until = step + cfg.pruning_protection_steps
                     if world_rank == 0:
-                        print(f"Pruning protection activated: GS count {num_gs} < {cfg.min_gs_count}. "
+                        print(f"Pruning protection activated: GS count {num_gs_before} < {cfg.min_gs_count}. "
                               f"Pruning disabled until step {self.pruning_protection_active_until}")
+            
+            # CRITICAL: If GS count is critically low, temporarily increase opacity threshold
+            # This prevents aggressive pruning by making fewer Gaussians eligible for pruning
+            original_opacity_threshold = None
+            if num_gs_before < 200:  # Critically low
+                # Temporarily increase opacity threshold to prevent pruning
+                if isinstance(self.cfg.strategy, DefaultStrategy):
+                    original_opacity_threshold = getattr(self.cfg.strategy, 'opacity_threshold', None)
+                    if hasattr(self.cfg.strategy, 'opacity_threshold'):
+                        # Increase threshold significantly to prevent pruning
+                        self.cfg.strategy.opacity_threshold = max(
+                            cfg.min_opacity_threshold * 10.0,  # 10x higher
+                            getattr(self.cfg.strategy, 'opacity_threshold', 0.005) * 5.0
+                        )
 
             # Run post-backward steps after backward and optimizer
-            # Skip pruning if protection is active
-            should_prune = (num_gs >= cfg.min_gs_count or step >= self.pruning_protection_active_until)
+            # Skip pruning if protection is active AND count is critically low
+            should_prune = (num_gs_before >= cfg.min_gs_count or step >= self.pruning_protection_active_until)
+            skip_densification = (num_gs_before < 50)  # Skip entirely if count is extremely low
             
-            if should_prune:
+            if skip_densification:
+                # GS count is critically low - skip densification/pruning entirely
+                if world_rank == 0 and step % 100 == 0:
+                    print(f"CRITICAL: GS count {num_gs_before} is extremely low. Skipping densification/pruning at step {step}")
+            elif should_prune:
                 # Normal densification with pruning enabled
                 if isinstance(self.cfg.strategy, DefaultStrategy):
                     self.cfg.strategy.step_post_backward(
@@ -1966,16 +2067,11 @@ class Runner:
                 else:
                     assert_never(self.cfg.strategy)
             else:
-                # Pruning protection active: only allow densification, skip pruning
-                # For DefaultStrategy, we can temporarily modify the state to skip pruning
-                # This is a workaround since we can't directly control the strategy's internal logic
+                # Pruning protection active: still allow densification but with higher opacity threshold
                 if world_rank == 0 and step % 100 == 0:
-                    print(f"Pruning protection active: GS count {num_gs}, skipping pruning at step {step}")
-                # Note: We still call step_post_backward but the strategy may have internal checks
-                # The opacity clamping above helps prevent aggressive pruning
+                    print(f"Pruning protection active: GS count {num_gs_before}, skipping pruning at step {step}")
+                # Call step_post_backward but with increased opacity threshold to prevent pruning
                 if isinstance(self.cfg.strategy, DefaultStrategy):
-                    # Try to preserve current GS count by being more conservative
-                    # The strategy will still run but opacity clamping should help
                     self.cfg.strategy.step_post_backward(
                         params=self.splats,
                         optimizers=self.optimizers,
@@ -1995,6 +2091,20 @@ class Runner:
                     )
                 else:
                     assert_never(self.cfg.strategy)
+            
+            # Restore original opacity threshold if we modified it
+            if original_opacity_threshold is not None and isinstance(self.cfg.strategy, DefaultStrategy):
+                if hasattr(self.cfg.strategy, 'opacity_threshold'):
+                    self.cfg.strategy.opacity_threshold = original_opacity_threshold
+            
+            # Check GS count AFTER pruning to catch any collapse
+            num_gs_after = len(self.splats["means"])
+            if num_gs_after == 0:
+                if world_rank == 0:
+                    print(f"ERROR: GS count reached 0 after pruning at step {step}. Stopping training.")
+                raise RuntimeError(f"GS count reached 0 after pruning at step {step}. "
+                                 f"Pruning protection failed. Consider: using MCMCStrategy, increasing min_gs_count, "
+                                 f"or reducing learning rates.")
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:

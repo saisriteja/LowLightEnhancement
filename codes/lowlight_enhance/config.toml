@@ -1,0 +1,132 @@
+# Configuration file for HDR Gaussian Splatting training
+# Lists will be combined to generate experiment configs
+
+[data]
+# List of data directories to experiment with (only this should be a list for multiple datasets)
+data_dirs = [
+    "/mnt/data0/teja/lowlight/LowLightEnhancement/dataset/LOM_full/bike"
+]
+# Downsample factor (single value, not a list)
+data_factors = 1
+
+[training]
+# Training steps (single value)
+max_steps = 30000
+# Batch size (single value)
+batch_sizes = 1
+# Learning rates (single values, not lists)
+means_lr = 1.6e-4
+scales_lr = 5e-3
+opacities_lr = 5e-2
+quats_lr = 1e-3
+sh0_lr = 2.5e-3
+shN_lr = 1.25e-4
+# Steps to evaluate (nested list - multiple checkpoint steps)
+eval_steps = [7000, 30000]
+# Steps to save (nested list - multiple checkpoint steps)
+save_steps = [7000, 30000]
+# Steps scaler (single value)
+steps_scaler = 1.0
+
+[model]
+# Initialization (single values)
+init_type = "sfm"
+init_num_pts = 100000
+init_extent = 3.0
+init_opa = 0.5
+init_scale = 0.1
+# Spherical harmonics (single values)
+sh_degree = 3
+sh_degree_interval = 1000
+# Regularization (single values)
+opacity_reg = 0.01
+scale_reg = 0.01
+
+[hdr]
+# Intrinsic decomposition (single values)
+enable_intrinsic_decomp = true
+albedo_reg_lambda = 0.01
+illum_reg_lambda = 0.01
+# Synthetic exposures (single values)
+enable_synthetic_exposures = true
+num_synthetic_exposures = 5
+# Curriculum learning (single values)
+curriculum_enabled = true
+curriculum_max_exposure = 10.0
+# Exposure optimization (single values)
+enable_exposure_opt = true
+exposure_lr = 1e-3
+
+[loss]
+# Loss type (single values)
+use_nll_loss = true
+use_log_space_loss = false
+log_space_eps = 1e-3
+# Loss weights (single values)
+ssim_lambda = 0.2
+ratio_lambda = 0.1
+sh_reg_lambda = 0.01
+ratio_loss_freq = 10
+enable_ratio_loss = true
+
+[rendering]
+# Camera settings (single values)
+camera_model = "pinhole"
+near_plane = 0.01
+far_plane = 1e10
+# Rasterization (single values)
+packed = false
+antialiased = false
+# Tone mapping (single value)
+virtual_gain = 50.0
+
+[results]
+# Base directory for results
+base_result_dir = "results/v2"
+# Test every N images (single value)
+test_every = 8
+# Normalize world space (single value)
+normalize_world_space = true
+# Global scale (single value)
+global_scale = 1.0
+
+[pruning]
+# Opacity pruning protection (single values)
+min_opacity_threshold = 0.001
+min_gs_count = 500
+pruning_protection_steps = 1000
+enable_opacity_clamping = true
+
+[other]
+# Disable viewer (single value)
+disable_viewer = false
+# Port for viewer (single value)
+port = 8080
+# Save PLY files (single value)
+save_ply = false
+# PLY save steps (nested list - multiple checkpoint steps)
+ply_steps = [7000, 30000]
+# Disable video generation (single value)
+disable_video = false
+# Render trajectory path (single value)
+render_traj_path = "interp"
+# Tensorboard (single values)
+tb_every = 100
+tb_save_image = false
+lpips_net = "alex"
+# Strategy (will be set in code, not from TOML)
+# strategy = "mcmc"  # Options: "default" or "mcmc"
+
+[logging]
+# CSV columns to log (if not specified, uses default columns)
+# Available columns: step, loss, loss_nll, l1loss, ssimloss, loss_ratio, loss_sh,
+#                     loss_albedo_reg, loss_illum_sparse, curriculum_exposure, depthloss, tvloss,
+#                     exposure_mean, exposure_std, num_GS, mem, min_GS_reached, pruning_protection_active
+csv_columns = [
+    "step", "loss", "loss_nll", "l1loss", "ssimloss", 
+    "loss_ratio", "loss_sh", "loss_albedo_reg", "loss_illum_sparse",
+    "curriculum_exposure", "depthloss", "tvloss",
+    "exposure_mean", "exposure_std", "num_GS", "mem",
+    "min_GS_reached", "pruning_protection_active"
+]
+
