@@ -39,7 +39,7 @@ init_scale = 0.1
 sh_degree = 3
 sh_degree_interval = 1000
 # Regularization (single values)
-opacity_reg = 0.01
+opacity_reg = 0.1
 scale_reg = 0.01
 
 [hdr]

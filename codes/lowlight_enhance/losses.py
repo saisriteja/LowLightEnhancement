@@ -37,15 +37,17 @@ def poisson_gaussian_nll_loss(rendered: Tensor, gt: Tensor, eps: float = 1e-3) -
     """
     # variance = detaching the rendered values to stop the 'cheat'
     # we add a noise floor (eps) to prevent log(0)
-    variance = rendered.detach() + eps  # detach() acts as stop_gradient
+    # Clamp variance to prevent extreme values that could destabilize training
+    variance = rendered.detach().clamp(min=1e-2, max=10.0) + eps  # detach() acts as stop_gradient
     
     # 1. The residual term (MSE weighted by signal)
     residual = ((rendered - gt) ** 2) / (2 * variance)
     
     # 2. The log term (This is what makes it go negative)
+    # Weight log term less to reduce its impact
     log_term = torch.log(variance)
     
-    return torch.mean(residual + log_term)
+    return torch.mean(residual + 0.1 * log_term)
 
 
 class LossComputer:
@@ -142,7 +144,7 @@ class LossComputer:
                     sh_degree=sh_degree_to_use,
                     near_plane=near_plane,
                     far_plane=far_plane,
-                    apply_exposure=False,  # Exposure handled via exposure_value if intrinsic decomp
+                    apply_exposure=True,  # Use exposure when rendering both images for ratio loss
                     **exposure_kwarg,
                 )
                 radiances.append(rad[..., 0:3])

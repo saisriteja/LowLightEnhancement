@@ -268,12 +268,12 @@ class Runner:
             init_extent=getattr(cfg, 'init_extent', 3.0),
             init_opacity=getattr(cfg, 'init_opa', 0.1),
             init_scale=getattr(cfg, 'init_scale', 1.0),
-            means_lr=getattr(cfg, 'means_lr', 1.6e-4),
-            scales_lr=getattr(cfg, 'scales_lr', 5e-3),
-            opacities_lr=getattr(cfg, 'opacities_lr', 5e-2),
-            quats_lr=getattr(cfg, 'quats_lr', 1e-3),
-            sh0_lr=getattr(cfg, 'sh0_lr', 2.5e-3),
-            shN_lr=getattr(cfg, 'shN_lr', 1.25e-4),
+            means_lr=getattr(cfg, 'means_lr', 1.6e-4) * 0.5,
+            scales_lr=getattr(cfg, 'scales_lr', 5e-3) * 0.5,
+            opacities_lr=getattr(cfg, 'opacities_lr', 5e-2) * 0.5,
+            quats_lr=getattr(cfg, 'quats_lr', 1e-3) * 0.5,
+            sh0_lr=getattr(cfg, 'sh0_lr', 2.5e-3) * 0.5,
+            shN_lr=getattr(cfg, 'shN_lr', 1.25e-4) * 0.5,
             scene_scale=self.scene_scale,
             sh_degree=getattr(cfg, 'sh_degree', 3),
             sparse_grad=getattr(cfg, 'sparse_grad', False),
@@ -764,7 +764,7 @@ class Runner:
             # Gradient clipping
             use_nll_loss = getattr(cfg, 'use_nll_loss', False)
             if use_nll_loss or getattr(cfg, 'use_log_space_loss', False):
-                torch.nn.utils.clip_grad_norm_(self.splats.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.splats.parameters(), max_norm=5.0)
             
             desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
             if getattr(cfg, 'depth_loss', False) and loss_dict.get('depthloss') is not None:
@@ -1222,10 +1222,16 @@ class Runner:
         with open(self.csv_file, 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                step = int(row['step'])
-                steps.append(step)
+                try:
+                    # Convert step from float string to int (handles '0.0' -> 0)
+                    step = int(float(row['step']))
+                    steps.append(step)
+                except (ValueError, TypeError, KeyError):
+                    # Skip invalid rows
+                    continue
+                
                 for key in row.keys():
-                    if key != 'step' and row[key] and row[key] != 'None':
+                    if key != 'step' and row[key] and row[key] not in ['None', 'nan', '']:
                         try:
                             losses[key].append(float(row[key]))
                         except (ValueError, TypeError):
@@ -1370,6 +1376,10 @@ def run_training(cfg_dict: Dict[str, Any]):
     if not hasattr(cfg, 'strategy') or cfg.strategy is None:
         from gsplat.strategy import MCMCStrategy
         cfg.strategy = MCMCStrategy(verbose=True)
+    
+    # Set earlier densification stop for training stability
+    if hasattr(cfg, 'strategy') and cfg.strategy is not None:
+        cfg.strategy.refine_stop_iter = 15000
     
     # Adjust steps if needed
     if hasattr(cfg, 'steps_scaler') and cfg.steps_scaler != 1.0:
