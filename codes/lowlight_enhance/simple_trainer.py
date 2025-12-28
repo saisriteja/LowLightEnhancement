@@ -1645,8 +1645,8 @@ class Runner:
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
         
-        # Exposure values to render
-        exposure_values = [0.0, 1.0, -1.0]
+        # Exposure values to render: from -3 to +3 EV in 1 EV steps
+        exposure_values = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
         
         # Reset debug flags for new rendering session
         if hasattr(self, '_last_exposure_debug'):
