@@ -242,6 +242,12 @@ class Config:
     visibility_mlp_lr: float = 1e-4
     reflect_loss_freq: int = 5  # Compute reflectance consistency loss every N steps
 
+    # Debug output and MLP control parameters
+    debug_save_interval: int = 5000  # Interval for saving debug outputs (0 to disable)
+    debug_disable_perturbation_mlp: bool = False  # Disable perturbation MLP for debugging
+    debug_disable_illumination_mlp: bool = False  # Disable illumination MLP for debugging
+    debug_disable_visibility_mlp: bool = False  # Disable visibility MLP for debugging
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -325,8 +331,10 @@ def create_splats_with_optimizers(
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
         # Add reflectance parameter initialized from RGB colors
         # Reflectance R is the intrinsic material property
+        # Use much lower learning rate to prevent compensation for illumination changes
         reflectance_init = rgbs  # [N, 3] - initialize from RGB colors
-        params.append(("reflectance", torch.nn.Parameter(reflectance_init), sh0_lr))
+        reflectance_lr = sh0_lr * 0.01  # 100x lower LR to prevent compensation
+        params.append(("reflectance", torch.nn.Parameter(reflectance_init), reflectance_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -335,7 +343,8 @@ def create_splats_with_optimizers(
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
         # Add reflectance for feature-based mode too
         reflectance_init = rgbs  # [N, 3]
-        params.append(("reflectance", torch.nn.Parameter(reflectance_init), sh0_lr))
+        reflectance_lr = sh0_lr * 0.01  # 100x lower LR to prevent compensation
+        params.append(("reflectance", torch.nn.Parameter(reflectance_init), reflectance_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -389,6 +398,8 @@ class Runner:
         os.makedirs(self.render_dir, exist_ok=True)
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
+        self.debug_dir = f"{cfg.result_dir}/debug"
+        os.makedirs(self.debug_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -654,12 +665,23 @@ class Runner:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
         # Apply intrinsic factorization: I = R ⊙ L(e) ⊙ V(view)
+        # During training: use reflectance-based factorization (for gradients)
+        # During inference: skip this and use direct exposure scaling instead (to avoid compensation)
+        L_e_applied = None
+        V_view_applied = None
+        
+        # Only apply reflectance-based factorization during training (when gradients are enabled)
+        apply_reflectance_factorization = torch.is_grad_enabled()
+        
         if (
             exposure_ev is not None
             and self.cfg.enable_intrinsic_factorization
+            and not self.cfg.debug_disable_illumination_mlp
+            and not self.cfg.debug_disable_visibility_mlp
             and self.illumination_mlp is not None
             and self.visibility_mlp is not None
             and "reflectance" in self.splats
+            and apply_reflectance_factorization  # Only during training
         ):
             N_G = means.shape[0]
             reflectance = self.splats["reflectance"]  # [N_G, 3]
@@ -673,17 +695,38 @@ class Runner:
             # Compute view directions
             view_dirs = compute_view_directions(means, camtoworlds)  # [N_G, 2]
             
-            # Get L(e) and V(view)
-            if self.world_size > 1:
-                L_e = self.illumination_mlp.module(exposure_norm_expanded)  # [N_G, 3]
-                V_view = self.visibility_mlp.module(view_dirs)  # [N_G, 3]
+            # Get L(e) and V(view) - handle debug flags
+            if self.cfg.debug_disable_illumination_mlp:
+                L_e = torch.ones((N_G, 3), device=self.device)  # [N_G, 3] - no illumination change
             else:
-                L_e = self.illumination_mlp(exposure_norm_expanded)  # [N_G, 3]
-                V_view = self.visibility_mlp(view_dirs)  # [N_G, 3]
+                if self.world_size > 1:
+                    L_e = self.illumination_mlp.module(exposure_norm_expanded)  # [N_G, 3]
+                else:
+                    L_e = self.illumination_mlp(exposure_norm_expanded)  # [N_G, 3]
+                
+                # Track exposure for debug (no printing to avoid clutter)
+                if not hasattr(self, '_last_exposure_debug'):
+                    self._last_exposure_debug = exposure_ev
+            
+            if self.cfg.debug_disable_visibility_mlp:
+                V_view = torch.ones((N_G, 3), device=self.device)  # [N_G, 3] - no visibility change
+            else:
+                if self.world_size > 1:
+                    V_view = self.visibility_mlp.module(view_dirs)  # [N_G, 3]
+                else:
+                    V_view = self.visibility_mlp(view_dirs)  # [N_G, 3]
+            
+            # Store for application after rasterization (to avoid reflectance compensation)
+            L_e_applied = L_e
+            V_view_applied = V_view
             
             # Apply factorization: colors_intrinsic = R ⊙ L(e) ⊙ V(view)
             # For SH colors, apply to band 0 (RGB base color)
             colors_intrinsic_band0 = reflectance.unsqueeze(1) * L_e.unsqueeze(1) * V_view.unsqueeze(1)  # [N_G, 1, 3]
+            
+            # Track debug flag (no printing to avoid clutter)
+            if not hasattr(self, '_debug_colors_printed'):
+                self._debug_colors_printed = True
             
             # Combine with higher-order SH bands (view-dependent effects)
             if colors.shape[1] > 1:
@@ -695,6 +738,7 @@ class Runner:
         if (
             exposure_ev is not None
             and self.cfg.enable_multi_exposure
+            and not self.cfg.debug_disable_perturbation_mlp
             and self.perturbation_mlp is not None
         ):
             # Normalize exposure
@@ -770,6 +814,23 @@ class Runner:
         )
         if masks is not None:
             render_colors[~masks] = 0
+        
+        # Apply direct exposure-based brightness scaling during inference only
+        # This is a simple, predictable enhancement that can't be compensated
+        if (exposure_ev is not None 
+            and not torch.is_grad_enabled() 
+            and self.cfg.enable_multi_exposure):
+            # Direct exposure-to-brightness mapping: brightness = 2^exposure_ev
+            # This matches how real cameras work: +1 EV = 2x brightness
+            exposure_brightness = 2.0 ** exposure_ev  # Simple, predictable scaling
+            
+            # Apply to rendered colors: multiply RGB channels
+            # render_colors shape: [C, H, W, channels] where channels can be 3 or 4
+            if render_colors.shape[-1] >= 3:
+                render_colors[..., 0:3] = render_colors[..., 0:3] * exposure_brightness
+                # Clamp to valid range
+                render_colors[..., 0:3] = torch.clamp(render_colors[..., 0:3], 0.0, 1.0)
+        
         return render_colors, render_alphas, info
 
     def train(self):
@@ -1226,6 +1287,10 @@ class Runner:
                     ]
                     self.csv_writer.writerow(row)
                     self.csv_file_handle.flush()
+                
+                # Debug output saving
+                if cfg.debug_save_interval > 0 and step % cfg.debug_save_interval == 0:
+                    self.save_debug_outputs(step, pixels, colors, current_exposure)
 
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
@@ -1405,6 +1470,43 @@ class Runner:
                 self.viewer.update(step, num_train_rays_per_step)
 
     @torch.no_grad()
+    def save_debug_outputs(self, step: int, pixels: Tensor, colors: Tensor, current_exposure: Optional[float]):
+        """Save debug outputs: GT vs rendered comparison images."""
+        if self.world_rank != 0:
+            return
+        
+        cfg = self.cfg
+        
+        # Create side-by-side comparison: GT | Rendered
+        pixels_np = pixels.detach().cpu().numpy()  # [1, H, W, 3]
+        colors_np = colors.detach().cpu().numpy()  # [1, H, W, 3]
+        colors_np = np.clip(colors_np, 0.0, 1.0)  # Ensure valid range
+        
+        # Concatenate horizontally
+        canvas = np.concatenate([pixels_np, colors_np], axis=2)  # [1, H, 2*W, 3]
+        canvas = canvas.squeeze(0)  # [H, 2*W, 3]
+        
+        # Convert to uint8
+        canvas = (canvas * 255).astype(np.uint8)
+        
+        # Create filename with metadata
+        mlp_state = []
+        if cfg.debug_disable_perturbation_mlp:
+            mlp_state.append("no_perturb")
+        if cfg.debug_disable_illumination_mlp:
+            mlp_state.append("no_illum")
+        if cfg.debug_disable_visibility_mlp:
+            mlp_state.append("no_vis")
+        mlp_suffix = "_" + "_".join(mlp_state) if mlp_state else ""
+        exposure_suffix = f"_exp{current_exposure:.2f}" if current_exposure is not None else ""
+        
+        filename = f"{self.debug_dir}/debug_step{step:06d}{mlp_suffix}{exposure_suffix}.png"
+        imageio.imwrite(filename, canvas)
+        
+        if step % (cfg.debug_save_interval * 10) == 0:  # Print every 10 debug saves
+            print(f"Debug output saved: {filename}")
+
+    @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
         print("Running evaluation...")
@@ -1539,35 +1641,69 @@ class Runner:
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
-        # save to video
+        # Render videos with different exposure values
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
-        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
+        
+        # Exposure values to render
+        exposure_values = [0.0, 1.0, -1.0]
+        
+        # Reset debug flags for new rendering session
+        if hasattr(self, '_last_exposure_debug'):
+            delattr(self, '_last_exposure_debug')
+        if hasattr(self, '_debug_colors_printed'):
+            delattr(self, '_debug_colors_printed')
+        
+        for exposure_ev in exposure_values:
+            # Reset per-exposure debug flag
+            self._debug_colors_printed = False
+            print(f"Rendering trajectory with exposure EV={exposure_ev:.1f}...")
+            # Create filename with exposure value (format: exp0.0, exp1.0, exp-1.0)
+            exposure_str = f"{exposure_ev:+.1f}".replace("+", "")
+            writer = imageio.get_writer(f"{video_dir}/traj_{step}_exp{exposure_str}.mp4", fps=30)
+            
+            # Test illumination MLP output for this exposure (save to file for debugging)
+            if (cfg.enable_intrinsic_factorization 
+                and self.illumination_mlp is not None 
+                and not cfg.debug_disable_illumination_mlp
+                and self.world_rank == 0):
+                exposure_norm = torch.clamp(torch.tensor(exposure_ev / 2.0, device=device), -1, 1)
+                exposure_norm_test = exposure_norm.unsqueeze(0)  # [1, 1]
+                if self.world_size > 1:
+                    L_e_test = self.illumination_mlp.module(exposure_norm_test)
+                else:
+                    L_e_test = self.illumination_mlp(exposure_norm_test)
+                # Save to debug file
+                debug_log_file = f"{cfg.result_dir}/illumination_debug.txt"
+                with open(debug_log_file, "a") as f:
+                    f.write(f"Step {step}, Exposure EV={exposure_ev:.1f} (norm={exposure_norm.item():.3f}): L_e = {L_e_test.squeeze().detach().cpu().numpy()}\n")
+            
+            for i in tqdm.trange(len(camtoworlds_all), desc=f"Rendering trajectory (exp={exposure_ev:.1f})"):
+                camtoworlds = camtoworlds_all[i : i + 1]
+                Ks = K[None]
 
-            renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [1, H, W, 4]
-            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
-            depths = renders[..., 3:4]  # [1, H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
-            canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
+                renders, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+ED",
+                    exposure_ev=exposure_ev,  # Pass exposure value to enable MLPs
+                )  # [1, H, W, 4]
+                colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
+                depths = renders[..., 3:4]  # [1, H, W, 1]
+                depths = (depths - depths.min()) / (depths.max() - depths.min())
+                canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
 
-            # write images
-            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-            canvas = (canvas * 255).astype(np.uint8)
-            writer.append_data(canvas)
-        writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+                # write images
+                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                canvas = (canvas * 255).astype(np.uint8)
+                writer.append_data(canvas)
+            writer.close()
+            print(f"Video saved to {video_dir}/traj_{step}_exp{exposure_str}.mp4")
 
     @torch.no_grad()
     def run_compression(self, step: int):

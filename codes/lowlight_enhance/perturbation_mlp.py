@@ -102,9 +102,10 @@ class IlluminationMLP(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc_out = nn.Linear(hidden_dim, 3)  # Output RGB illumination
         
-        # Initialize to output [1, 1, 1] at exposure=0
-        # This fixes the scale ambiguity: L(0) = [1, 1, 1]
-        nn.init.zeros_(self.fc_out.weight)
+        # Initialize to encourage learning exposure-dependent variations
+        # Use larger initialization to encourage the MLP to learn meaningful variations
+        # L(0) = 1.0 is enforced by the forward formula, not initialization
+        nn.init.normal_(self.fc_out.weight, mean=0.0, std=0.5)  # Increased std from 0.1 to 0.5
         nn.init.zeros_(self.fc_out.bias)
         
     def forward(self, exposure_normalized: torch.Tensor) -> torch.Tensor:
@@ -122,11 +123,17 @@ class IlluminationMLP(nn.Module):
         x = F.relu(self.fc2(x))
         out = self.fc_out(x)  # [N, 3]
         
-        # Ensure positive output: use sigmoid-based activation
-        # L(e) = 1 + tanh(out) * scale_factor
-        # Constrain to [0.5, 1.5] range as per update.md
-        # L(0) = 1.0 (hard constraint)
-        illumination = 1.0 + torch.tanh(out) * 0.5  # L ∈ [0.5, 1.5], L(0) = 1
+        # Use exponential mapping: L(e) = exp(exposure_norm * learned_log_scale)
+        # This ensures L(0) = 1.0 exactly and allows exponential variation
+        # learned_log_scale = tanh(out) * max_log_scale ensures bounded output
+        # For exposure_norm = ±1, L ∈ [exp(-max_log_scale), exp(max_log_scale)]
+        max_log_scale = 1.0  # Allows L ∈ [0.37, 2.72] for exposure_norm = ±1
+        learned_log_scale = torch.tanh(out) * max_log_scale  # [N, 3]
+        
+        # L(e) = exp(exposure_norm * learned_log_scale)
+        # When exposure_norm = 0: L = exp(0) = 1.0 ✓
+        # When exposure_norm = 0.5 (EV=1.0): L = exp(0.5 * learned_log_scale) can vary significantly
+        illumination = torch.exp(exposure_normalized * learned_log_scale)
         
         return illumination
 
