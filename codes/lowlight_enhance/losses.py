@@ -7,6 +7,20 @@ Implements exposure consistency, smoothness, and regularization losses.
 import torch
 import torch.nn.functional as F
 
+# Import knn from utils (gsplat examples utils)
+try:
+    from utils import knn
+except ImportError:
+    # Fallback: define a simple KNN if not available
+    def knn(points, k):
+        """Simple KNN implementation using pairwise distances."""
+        import torch.nn.functional as F
+        distances = torch.cdist(points, points)  # [N, N]
+        distances.fill_diagonal_(float('inf'))  # Exclude self
+        _, indices = torch.topk(distances, k, dim=1, largest=False)
+        distances_selected = torch.gather(distances, 1, indices)
+        return distances_selected, indices
+
 
 def compute_exposure_consistency_loss(
     gaussians: torch.nn.ParameterDict,
@@ -309,4 +323,107 @@ def compute_visibility_smoothness_loss(
         loss += weight * torch.mean(diff ** 2)
     
     return lambda_weight * loss / len(view_pairs) if len(view_pairs) > 0 else torch.tensor(0.0, device=device)
+
+
+def compute_structure_loss(
+    rendered_image: torch.Tensor,
+    target_image: torch.Tensor,
+    lambda_weight: float = 2.0,
+) -> torch.Tensor:
+    """
+    Structure-preserving loss using gradient/edge detection (Sobel operator).
+    
+    Preserves image structure by penalizing differences in image gradients.
+    
+    Args:
+        rendered_image: [B, H, W, 3] - Rendered image
+        target_image: [B, H, W, 3] - Target image
+        lambda_weight: Loss weight
+    
+    Returns:
+        Scalar loss tensor
+    """
+    # Convert to [B, 3, H, W] for convolution
+    if rendered_image.dim() == 4 and rendered_image.shape[-1] == 3:
+        rendered = rendered_image.permute(0, 3, 1, 2)  # [B, 3, H, W]
+        target = target_image.permute(0, 3, 1, 2)  # [B, 3, H, W]
+    else:
+        rendered = rendered_image
+        target = target_image
+    
+    # Sobel kernels for gradient computation
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                          dtype=rendered.dtype, device=rendered.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                          dtype=rendered.dtype, device=rendered.device).view(1, 1, 3, 3)
+    
+    # Compute gradients for each channel
+    grad_rendered_x = F.conv2d(rendered, sobel_x.repeat(3, 1, 1, 1), groups=3, padding=1)
+    grad_rendered_y = F.conv2d(rendered, sobel_y.repeat(3, 1, 1, 1), groups=3, padding=1)
+    grad_target_x = F.conv2d(target, sobel_x.repeat(3, 1, 1, 1), groups=3, padding=1)
+    grad_target_y = F.conv2d(target, sobel_y.repeat(3, 1, 1, 1), groups=3, padding=1)
+    
+    # Compute gradient magnitude
+    grad_rendered = torch.sqrt(grad_rendered_x ** 2 + grad_rendered_y ** 2 + 1e-8)
+    grad_target = torch.sqrt(grad_target_x ** 2 + grad_target_y ** 2 + 1e-8)
+    
+    # L1 loss on gradient magnitudes
+    loss = F.l1_loss(grad_rendered, grad_target)
+    
+    return lambda_weight * loss
+
+
+def compute_reflectance_spatial_smoothness_loss(
+    reflectance: torch.Tensor,
+    positions: torch.Tensor,
+    lambda_weight: float = 1.0,
+    k_neighbors: int = 8,
+) -> torch.Tensor:
+    """
+    Enforce spatial smoothness on reflectance R.
+    
+    Reflectance should vary slowly across space (neighboring Gaussians should have similar reflectance).
+    Uses KNN to find neighbors and penalizes differences.
+    
+    Args:
+        reflectance: [N_G, 3] - Reflectance values for each Gaussian
+        positions: [N_G, 3] - Gaussian positions
+        lambda_weight: Loss weight
+        k_neighbors: Number of nearest neighbors to consider
+    
+    Returns:
+        Scalar loss tensor
+    """
+    N_G = reflectance.shape[0]
+    if N_G < k_neighbors + 1:
+        device = reflectance.device
+        return torch.tensor(0.0, device=device)
+    
+    # Find k nearest neighbors for each Gaussian
+    # Detach positions for KNN computation (we only need neighbor indices, not gradients through positions)
+    positions_detached = positions.detach()
+    
+    # Compute pairwise distances
+    # positions_detached: [N_G, 3]
+    pairwise_distances = torch.cdist(positions_detached, positions_detached)  # [N_G, N_G]
+    # Set diagonal to inf to exclude self
+    pairwise_distances.fill_diagonal_(float('inf'))
+    
+    # Get k+1 nearest neighbors (including self, which we'll exclude)
+    _, indices = torch.topk(pairwise_distances, k_neighbors + 1, dim=1, largest=False)  # [N_G, k+1]
+    # Exclude self (first neighbor is self)
+    neighbor_indices = indices[:, 1:]  # [N_G, k]
+    
+    # Compute reflectance differences with neighbors
+    loss = 0.0
+    for i in range(N_G):
+        neighbors = neighbor_indices[i]  # [k]
+        R_i = reflectance[i:i+1]  # [1, 3]
+        R_neighbors = reflectance[neighbors]  # [k, 3]
+        
+        # L2 distance to neighbors
+        diff = R_i - R_neighbors  # [k, 3]
+        loss += torch.mean(diff ** 2)
+    
+    return lambda_weight * loss / N_G
 

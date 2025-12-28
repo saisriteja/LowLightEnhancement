@@ -10,21 +10,29 @@
 #     --steps_scaler 1
 
 # Distributed training on multiple GPUs with multi-exposure and intrinsic factorization
+# Updated with new loss weights and parameters from update.md
 CUDA_VISIBLE_DEVICES=1,3 python simple_trainer.py default \
     --data_dir /mnt/data0/teja/lowlight/LowLightEnhancement/dataset/LOM_full/bike \
     --result_dir ./results/bike_multi_exposure_v2 \
     --enable_multi_exposure \
     --enable_intrinsic_factorization \
     --steps_scaler 1 \
-    --lambda_consist 0.5 \
-    --lambda_smooth 0.1 \
-    --lambda_reg 1e-4 \
+    --lambda_consist 5.0 \
+    --lambda_smooth 10.0 \
+    --lambda_reg 0.01 \
+    --lambda_structure 2.0 \
     --mlp_lr 1e-4 \
-    --lambda_reflect 1.0 \
-    --lambda_illum_smooth 0.1 \
+    --lambda_reflect 10.0 \
+    --lambda_illum_smooth 1.0 \
     --lambda_vis_smooth 0.1 \
+    --lambda_reflect_spatial 1.0 \
     --illumination_mlp_lr 1e-4 \
-    --visibility_mlp_lr 1e-4
+    --visibility_mlp_lr 1e-4 \
+    --max_delta_c 0.1 \
+    --max_delta_alpha 0.05 \
+    --max_delta_sigma 0.05 \
+    --exposure_curriculum_phases 3000 10000 20000 \
+    --consist_loss_freq 1
 
 # MCMC strategy with multi-exposure and intrinsic factorization:
 # CUDA_VISIBLE_DEVICES=1,3 python simple_trainer.py mcmc \

@@ -27,9 +27,9 @@ class PerturbationMLP(nn.Module):
     def __init__(
         self,
         hidden_dim: int = 32,
-        max_delta_c: float = 0.5,
-        max_delta_alpha: float = 0.25,
-        max_delta_sigma: float = 0.1,
+        max_delta_c: float = 0.1,
+        max_delta_alpha: float = 0.05,
+        max_delta_sigma: float = 0.05,
     ):
         super().__init__()
         
@@ -124,9 +124,9 @@ class IlluminationMLP(nn.Module):
         
         # Ensure positive output: use sigmoid-based activation
         # L(e) = 1 + tanh(out) * scale_factor
-        # This ensures L(0) = 1 and L ∈ [1-scale, 1+scale]
-        # For scale_factor = 1, L ∈ [0, 2], L(0) = 1
-        illumination = 1.0 + torch.tanh(out) * 1.0  # L ∈ [0, 2], L(0) = 1
+        # Constrain to [0.5, 1.5] range as per update.md
+        # L(0) = 1.0 (hard constraint)
+        illumination = 1.0 + torch.tanh(out) * 0.5  # L ∈ [0.5, 1.5], L(0) = 1
         
         return illumination
 

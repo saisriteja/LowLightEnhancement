@@ -46,6 +46,8 @@ from losses import (
     compute_reflectance_consistency_loss,
     compute_illumination_smoothness_loss,
     compute_visibility_smoothness_loss,
+    compute_structure_loss,
+    compute_reflectance_spatial_smoothness_loss,
 )
 # Import multi-exposure utils functions from exposure_utils.py
 from exposure_utils import (
@@ -214,26 +216,28 @@ class Config:
     # Multi-exposure Gaussian Splatting parameters
     enable_multi_exposure: bool = True
     perturbation_mlp_hidden_dim: int = 32
-    max_delta_c: float = 0.5
-    max_delta_alpha: float = 0.25
-    max_delta_sigma: float = 0.1
-    lambda_consist: float = 0.5
-    lambda_smooth: float = 0.1
-    lambda_reg: float = 1e-4
+    max_delta_c: float = 0.1  # Reduced from 0.5
+    max_delta_alpha: float = 0.05  # Reduced from 0.25
+    max_delta_sigma: float = 0.05  # Reduced from 0.1
+    lambda_consist: float = 5.0  # Increased from 0.5
+    lambda_smooth: float = 10.0  # Increased from 0.1
+    lambda_reg: float = 0.01  # Increased from 1e-4
+    lambda_structure: float = 2.0  # NEW - gradient/edge loss weight
     lambda_curriculum_init: float = 10.0
     curriculum_decay_tau: int = 300
     mlp_lr: float = 1e-4
-    exposure_curriculum_phases: List[int] = field(default_factory=lambda: [300, 600, 1000])
+    exposure_curriculum_phases: List[int] = field(default_factory=lambda: [3000, 10000, 20000])  # Multiplied by 10x
     exposure_range_per_phase: List[float] = field(default_factory=lambda: [1.0, 2.0, 3.0])
-    consist_loss_freq: int = 3
+    consist_loss_freq: int = 1  # Compute every step (was 3)
 
     # Intrinsic factorization parameters
     enable_intrinsic_factorization: bool = True
     illumination_mlp_hidden_dim: int = 32
     visibility_mlp_hidden_dim: int = 32
-    lambda_reflect: float = 1.0
-    lambda_illum_smooth: float = 0.1
+    lambda_reflect: float = 10.0  # Increased from 1.0
+    lambda_illum_smooth: float = 1.0  # Increased from 0.1
     lambda_vis_smooth: float = 0.1
+    lambda_reflect_spatial: float = 1.0  # NEW - spatial smoothness on reflectance
     illumination_mlp_lr: float = 1e-4
     visibility_mlp_lr: float = 1e-4
     reflect_loss_freq: int = 5  # Compute reflectance consistency loss every N steps
@@ -405,9 +409,11 @@ class Runner:
                 "loss_smooth",
                 "loss_reg",
                 "loss_curriculum",
+                "loss_structure",
                 "loss_reflect",
                 "loss_illum_smooth",
                 "loss_vis_smooth",
+                "loss_reflect_spatial",
                 "exposure_ev",
                 "num_GS",
                 "mem",
@@ -919,11 +925,20 @@ class Runner:
             loss_photo = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             loss = loss_photo
             
+            # Structure-preserving loss (gradient/edge loss)
+            loss_structure = torch.tensor(0.0, device=device)
+            if cfg.enable_multi_exposure and cfg.lambda_structure > 0:
+                loss_structure = compute_structure_loss(
+                    colors, pixels, lambda_weight=cfg.lambda_structure
+                )
+                loss += loss_structure
+            
             # Multi-exposure losses
             loss_consist = torch.tensor(0.0, device=device)
             loss_smooth = torch.tensor(0.0, device=device)
             loss_reg = torch.tensor(0.0, device=device)
             loss_curriculum = torch.tensor(0.0, device=device)
+            loss_reflect_spatial = torch.tensor(0.0, device=device)
             
             if cfg.enable_multi_exposure and self.perturbation_mlp is not None:
                 means = self.splats["means"]
@@ -1100,6 +1115,16 @@ class Runner:
                             # Skip visibility smoothness if we can't get camera pairs
                             if world_rank == 0 and step % 100 == 0:
                                 print(f"Warning: Could not compute visibility smoothness loss: {e}")
+                    
+                    # Reflectance spatial smoothness loss (periodic)
+                    if step % 10 == 0 and cfg.lambda_reflect_spatial > 0:
+                        loss_reflect_spatial_val = compute_reflectance_spatial_smoothness_loss(
+                            reflectance_sample,
+                            means_sample,
+                            lambda_weight=cfg.lambda_reflect_spatial,
+                        )
+                        loss_reflect_spatial = loss_reflect_spatial_val
+                        loss += loss_reflect_spatial_val
             
             if cfg.depth_loss:
                 # query depths from depth map
@@ -1167,11 +1192,13 @@ class Runner:
                     self.writer.add_scalar("train/loss_smooth", loss_smooth.item(), step)
                     self.writer.add_scalar("train/loss_reg", loss_reg.item(), step)
                     self.writer.add_scalar("train/loss_curriculum", loss_curriculum.item(), step)
+                    self.writer.add_scalar("train/loss_structure", loss_structure.item() if isinstance(loss_structure, torch.Tensor) else 0.0, step)
                     self.writer.add_scalar("train/exposure_ev", current_exposure if current_exposure is not None else 0.0, step)
                 if cfg.enable_intrinsic_factorization:
                     self.writer.add_scalar("train/loss_reflect", loss_reflect.item() if isinstance(loss_reflect, torch.Tensor) else 0.0, step)
                     self.writer.add_scalar("train/loss_illum_smooth", loss_illum_smooth.item() if isinstance(loss_illum_smooth, torch.Tensor) else 0.0, step)
                     self.writer.add_scalar("train/loss_vis_smooth", loss_vis_smooth.item() if isinstance(loss_vis_smooth, torch.Tensor) else 0.0, step)
+                    self.writer.add_scalar("train/loss_reflect_spatial", loss_reflect_spatial.item() if isinstance(loss_reflect_spatial, torch.Tensor) else 0.0, step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -1188,9 +1215,11 @@ class Runner:
                         loss_smooth.item() if isinstance(loss_smooth, torch.Tensor) else 0.0,
                         loss_reg.item() if isinstance(loss_reg, torch.Tensor) else 0.0,
                         loss_curriculum.item() if isinstance(loss_curriculum, torch.Tensor) else 0.0,
+                        loss_structure.item() if isinstance(loss_structure, torch.Tensor) else 0.0,
                         loss_reflect.item() if isinstance(loss_reflect, torch.Tensor) else 0.0,
                         loss_illum_smooth.item() if isinstance(loss_illum_smooth, torch.Tensor) else 0.0,
                         loss_vis_smooth.item() if isinstance(loss_vis_smooth, torch.Tensor) else 0.0,
+                        loss_reflect_spatial.item() if isinstance(loss_reflect_spatial, torch.Tensor) else 0.0,
                         current_exposure if current_exposure is not None else 0.0,
                         len(self.splats["means"]),
                         mem,
