@@ -251,3 +251,4 @@ Regularizing higher bands encourages the model to:
 - Poisson-Gaussian Noise Model: Common in photon-limited imaging
 - Spherical Harmonics: Standard representation for view-dependent appearance
 
+

@@ -106,10 +106,6 @@ class IlluminationMLP(nn.Module):
         # This fixes the scale ambiguity: L(0) = [1, 1, 1]
         nn.init.zeros_(self.fc_out.weight)
         nn.init.zeros_(self.fc_out.bias)
-        # Bias should be such that tanh(0) * scale + offset = 1
-        # We'll use sigmoid activation, so initialize bias to logit(1) = large positive
-        # Actually, let's use a different approach: output = 1 + tanh(...) * scale
-        # This ensures output is always positive and starts at 1
         
     def forward(self, exposure_normalized: torch.Tensor) -> torch.Tensor:
         """
@@ -126,21 +122,10 @@ class IlluminationMLP(nn.Module):
         x = F.relu(self.fc2(x))
         out = self.fc_out(x)  # [N, 3]
         
-        # Ensure positive output: use softplus or sigmoid-based activation
-        # L(e) = 1 + tanh(out) * scale ensures L(0) ≈ 1 when out ≈ 0
-        # But we want L(0) = 1 exactly, so we'll use: L(e) = 1 + tanh(out) * (exp(scale) - 1)
-        # Actually simpler: L(e) = exp(tanh(out)) ensures L(0) = 1
-        # Or: L(e) = 1 + tanh(out) ensures L ∈ [0, 2] and L(0) = 1
-        
-        # Use sigmoid-based activation to ensure positive outputs
-        # L(e) = 1 + 2 * sigmoid(out) - 1 = 1 + 2 * (sigmoid(out) - 0.5)
-        # This gives L ∈ [0, 2] with L(0) ≈ 1 when out ≈ 0
-        # Better: L(e) = 0.5 + 1.5 * sigmoid(out) gives L ∈ [0.5, 2]
-        # Or simplest: L(e) = exp(tanh(out)) gives L ∈ [1/e, e] ≈ [0.37, 2.72]
-        
-        # Use: L(e) = 1 + tanh(out) * scale_factor
+        # Ensure positive output: use sigmoid-based activation
+        # L(e) = 1 + tanh(out) * scale_factor
         # This ensures L(0) = 1 and L ∈ [1-scale, 1+scale]
-        # For scale_factor = 1, L ∈ [0, 2]
+        # For scale_factor = 1, L ∈ [0, 2], L(0) = 1
         illumination = 1.0 + torch.tanh(out) * 1.0  # L ∈ [0, 2], L(0) = 1
         
         return illumination
