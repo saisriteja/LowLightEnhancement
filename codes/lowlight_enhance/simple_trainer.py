@@ -38,11 +38,14 @@ from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 # Multi-exposure imports
-from perturbation_mlp import PerturbationMLP
+from perturbation_mlp import PerturbationMLP, IlluminationMLP, VisibilityMLP
 from losses import (
     compute_exposure_consistency_loss,
     compute_smoothness_loss,
     compute_regularization_loss,
+    compute_reflectance_consistency_loss,
+    compute_illumination_smoothness_loss,
+    compute_visibility_smoothness_loss,
 )
 # Import multi-exposure utils functions from exposure_utils.py
 from exposure_utils import (
@@ -224,6 +227,17 @@ class Config:
     exposure_range_per_phase: List[float] = field(default_factory=lambda: [1.0, 2.0, 3.0])
     consist_loss_freq: int = 3
 
+    # Intrinsic factorization parameters
+    enable_intrinsic_factorization: bool = True
+    illumination_mlp_hidden_dim: int = 32
+    visibility_mlp_hidden_dim: int = 32
+    lambda_reflect: float = 1.0
+    lambda_illum_smooth: float = 0.1
+    lambda_vis_smooth: float = 0.1
+    illumination_mlp_lr: float = 1e-4
+    visibility_mlp_lr: float = 1e-4
+    reflect_loss_freq: int = 5  # Compute reflectance consistency loss every N steps
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -305,12 +319,19 @@ def create_splats_with_optimizers(
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        # Add reflectance parameter initialized from sh0 (RGB values)
+        # Reflectance R is the intrinsic material property
+        reflectance_init = rgbs  # [N, 3] - initialize from RGB colors
+        params.append(("reflectance", torch.nn.Parameter(reflectance_init), sh0_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
         colors = torch.logit(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+        # Add reflectance for feature-based mode too
+        reflectance_init = rgbs  # [N, 3]
+        params.append(("reflectance", torch.nn.Parameter(reflectance_init), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -384,6 +405,9 @@ class Runner:
                 "loss_smooth",
                 "loss_reg",
                 "loss_curriculum",
+                "loss_reflect",
+                "loss_illum_smooth",
+                "loss_vis_smooth",
                 "exposure_ev",
                 "num_GS",
                 "mem",
@@ -406,6 +430,41 @@ class Runner:
                 self.perturbation_mlp.parameters(),
                 lr=cfg.mlp_lr * math.sqrt(cfg.batch_size),
             )
+
+        # Intrinsic factorization setup
+        self.illumination_mlp = None
+        self.visibility_mlp = None
+        self.illumination_mlp_optimizer = None
+        self.visibility_mlp_optimizer = None
+        if cfg.enable_intrinsic_factorization:
+            self.illumination_mlp = IlluminationMLP(
+                hidden_dim=cfg.illumination_mlp_hidden_dim,
+            ).to(self.device)
+            self.visibility_mlp = VisibilityMLP(
+                hidden_dim=cfg.visibility_mlp_hidden_dim,
+            ).to(self.device)
+            
+            if world_size > 1:
+                self.illumination_mlp = DDP(self.illumination_mlp)
+                self.visibility_mlp = DDP(self.visibility_mlp)
+            
+            self.illumination_mlp_optimizer = torch.optim.Adam(
+                self.illumination_mlp.parameters(),
+                lr=cfg.illumination_mlp_lr * math.sqrt(cfg.batch_size),
+            )
+            self.visibility_mlp_optimizer = torch.optim.Adam(
+                self.visibility_mlp.parameters(),
+                lr=cfg.visibility_mlp_lr * math.sqrt(cfg.batch_size),
+            )
+            
+            # Initialize L(exposure=0) = [1, 1, 1] constraint
+            # This is already handled in IlluminationMLP initialization, but we verify it
+            with torch.no_grad():
+                zero_exposure = torch.zeros((1, 1), device=self.device)
+                L_zero = self.illumination_mlp.module if world_size > 1 else self.illumination_mlp
+                L_zero_val = L_zero(zero_exposure)
+                if world_rank == 0:
+                    print(f"Initialized IlluminationMLP: L(0) = {L_zero_val.squeeze().cpu().numpy()}")
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
@@ -587,6 +646,44 @@ class Runner:
             colors = torch.sigmoid(colors)
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+
+        # Apply intrinsic factorization: I = R ⊙ L(e) ⊙ V(view)
+        if (
+            exposure_ev is not None
+            and self.cfg.enable_intrinsic_factorization
+            and self.illumination_mlp is not None
+            and self.visibility_mlp is not None
+            and "reflectance" in self.splats
+        ):
+            N_G = means.shape[0]
+            reflectance = self.splats["reflectance"]  # [N_G, 3]
+            
+            # Normalize exposure
+            exposure_norm = torch.clamp(
+                torch.tensor(exposure_ev / 2.0, device=self.device), -1, 1
+            )
+            exposure_norm_expanded = exposure_norm.unsqueeze(0).repeat(N_G, 1)  # [N_G, 1]
+            
+            # Compute view directions
+            view_dirs = compute_view_directions(means, camtoworlds)  # [N_G, 2]
+            
+            # Get L(e) and V(view)
+            if self.world_size > 1:
+                L_e = self.illumination_mlp.module(exposure_norm_expanded)  # [N_G, 3]
+                V_view = self.visibility_mlp.module(view_dirs)  # [N_G, 3]
+            else:
+                L_e = self.illumination_mlp(exposure_norm_expanded)  # [N_G, 3]
+                V_view = self.visibility_mlp(view_dirs)  # [N_G, 3]
+            
+            # Apply factorization: colors_intrinsic = R ⊙ L(e) ⊙ V(view)
+            # For SH colors, apply to band 0 (RGB base color)
+            colors_intrinsic_band0 = reflectance.unsqueeze(1) * L_e.unsqueeze(1) * V_view.unsqueeze(1)  # [N_G, 1, 3]
+            
+            # Combine with higher-order SH bands (view-dependent effects)
+            if colors.shape[1] > 1:
+                colors = torch.cat([colors_intrinsic_band0, colors[:, 1:, :]], dim=1)  # [N, K, 3]
+            else:
+                colors = colors_intrinsic_band0  # [N, 1, 3]
 
         # Apply exposure-dependent perturbations if enabled
         if (
@@ -915,6 +1012,130 @@ class Runner:
                             print(f"  current_exposure: {current_exposure}")
                         break
                 
+                # Intrinsic factorization losses
+                loss_reflect = torch.tensor(0.0, device=device)
+                loss_illum_smooth = torch.tensor(0.0, device=device)
+                loss_vis_smooth = torch.tensor(0.0, device=device)
+                
+                if cfg.enable_intrinsic_factorization and self.illumination_mlp is not None and self.visibility_mlp is not None and "reflectance" in self.splats:
+                    means = self.splats["means"]
+                    reflectance = self.splats["reflectance"]  # [N_G, 3]
+                    view_dirs = compute_view_directions(means, camtoworlds)  # [N_G, 2]
+                    
+                    # Sample a subset of Gaussians for loss computation
+                    N_G = means.shape[0]
+                    max_samples = min(500, N_G)
+                    if N_G > max_samples:
+                        sample_indices = torch.randperm(N_G, device=device)[:max_samples]
+                        means_sample = means[sample_indices]
+                        view_dirs_sample = view_dirs[sample_indices]
+                        reflectance_sample = reflectance[sample_indices]
+                    else:
+                        means_sample = means
+                        view_dirs_sample = view_dirs
+                        reflectance_sample = reflectance
+                    
+                    # Reflectance consistency loss (periodic, requires multiple observations)
+                    if step % cfg.reflect_loss_freq == 0 and step > 100 and current_exposure is not None:
+                        # Create synthetic observations with different exposures
+                        # Observation 1: current exposure
+                        e1 = current_exposure
+                        e2 = current_exposure + 0.5  # Different exposure
+                        
+                        # Normalize exposures
+                        e1_norm = torch.clamp(torch.tensor(e1 / 2.0, device=device), -1, 1)
+                        e2_norm = torch.clamp(torch.tensor(e2 / 2.0, device=device), -1, 1)
+                        e1_norm_expanded = e1_norm.unsqueeze(0).repeat(max_samples, 1)
+                        e2_norm_expanded = e2_norm.unsqueeze(0).repeat(max_samples, 1)
+                        
+                        # Get L(e) and V(view) for both exposures
+                        illum_mlp = self.illumination_mlp.module if world_size > 1 else self.illumination_mlp
+                        vis_mlp = self.visibility_mlp.module if world_size > 1 else self.visibility_mlp
+                        
+                        L_e1 = illum_mlp(e1_norm_expanded)  # [N_G, 3]
+                        L_e2 = illum_mlp(e2_norm_expanded)  # [N_G, 3]
+                        V_view = vis_mlp(view_dirs_sample)  # [N_G, 3]
+                        
+                        # Compute I_k = R ⊙ L(e_k) ⊙ V(view) for both exposures
+                        I1 = reflectance_sample * L_e1 * V_view  # [N_G, 3]
+                        I2 = reflectance_sample * L_e2 * V_view  # [N_G, 3]
+                        
+                        # Create observations list
+                        observations = [
+                            {'exposure_ev': e1, 'view_dir': view_dirs_sample, 'intensity': I1},
+                            {'exposure_ev': e2, 'view_dir': view_dirs_sample, 'intensity': I2},
+                        ]
+                        
+                        # Compute reflectance consistency loss
+                        loss_reflect = compute_reflectance_consistency_loss(
+                            illum_mlp,
+                            vis_mlp,
+                            observations,
+                            lambda_weight=cfg.lambda_reflect,
+                        )
+                        loss += loss_reflect
+                    
+                    # Illumination smoothness loss (compute periodically)
+                    if step % 2 == 0 and current_exposure is not None:
+                        illum_mlp = self.illumination_mlp.module if world_size > 1 else self.illumination_mlp
+                        loss_illum_smooth = compute_illumination_smoothness_loss(
+                            illum_mlp,
+                            [current_exposure],
+                            delta_e=0.1,
+                            lambda_weight=cfg.lambda_illum_smooth,
+                        )
+                        loss += loss_illum_smooth
+                    
+                    # Visibility smoothness loss (compute periodically, requires camera pairs)
+                    if step % 5 == 0:  # Less frequent since it requires camera pairs
+                        vis_mlp = self.visibility_mlp.module if world_size > 1 else self.visibility_mlp
+                        
+                        # Sample a nearby camera from the dataset for comparison
+                        # Use current camera and a nearby one (if available)
+                        try:
+                            # Get all camera poses
+                            all_camtoworlds = self.parser.camtoworlds
+                            current_cam_idx = image_ids[0].item() if image_ids is not None else 0
+                            
+                            # Find a nearby camera (next camera in sequence)
+                            if len(all_camtoworlds) > 1:
+                                next_cam_idx = (current_cam_idx + 1) % len(all_camtoworlds)
+                                next_camtoworld = torch.from_numpy(all_camtoworlds[next_cam_idx]).float().to(device)
+                                
+                                # Compute view directions for next camera
+                                view_dirs_next = compute_view_directions(means_sample, next_camtoworld.unsqueeze(0))
+                                
+                                # Compute distance between cameras
+                                cam_pos_current = camtoworlds[0, :3, 3]
+                                cam_pos_next = next_camtoworld[:3, 3]
+                                distance = torch.norm(cam_pos_current - cam_pos_next).item()
+                                
+                                # Create view pairs
+                                view_pairs = [{
+                                    'view_dir_a': view_dirs_sample,
+                                    'view_dir_b': view_dirs_next,
+                                    'distance': distance,
+                                }]
+                                
+                                loss_vis_smooth = compute_visibility_smoothness_loss(
+                                    vis_mlp,
+                                    view_pairs,
+                                    lambda_weight=cfg.lambda_vis_smooth,
+                                )
+                                loss += loss_vis_smooth
+                        except Exception as e:
+                            # Skip visibility smoothness if we can't get camera pairs
+                            if world_rank == 0 and step % 100 == 0:
+                                print(f"Warning: Could not compute visibility smoothness loss: {e}")
+                    
+                    # Check for NaN/Inf in intrinsic factorization losses
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        if world_rank == 0:
+                            print(f"ERROR at step {step}: NaN/Inf in intrinsic factorization losses!")
+                            print(f"  loss_reflect: {loss_reflect.item()}, loss_illum_smooth: {loss_illum_smooth.item()}")
+                            print(f"  loss_vis_smooth: {loss_vis_smooth.item()}")
+                        break
+                
                 if cfg.depth_loss:
                     # query depths from depth map
                     points = torch.stack(
@@ -997,6 +1218,10 @@ class Runner:
                         self.writer.add_scalar("train/loss_reg", loss_reg.item(), step)
                         self.writer.add_scalar("train/loss_curriculum", loss_curriculum.item(), step)
                         self.writer.add_scalar("train/exposure_ev", current_exposure if current_exposure is not None else 0.0, step)
+                    if cfg.enable_intrinsic_factorization:
+                        self.writer.add_scalar("train/loss_reflect", loss_reflect.item() if isinstance(loss_reflect, torch.Tensor) else 0.0, step)
+                        self.writer.add_scalar("train/loss_illum_smooth", loss_illum_smooth.item() if isinstance(loss_illum_smooth, torch.Tensor) else 0.0, step)
+                        self.writer.add_scalar("train/loss_vis_smooth", loss_vis_smooth.item() if isinstance(loss_vis_smooth, torch.Tensor) else 0.0, step)
                     if cfg.tb_save_image:
                         canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                         canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -1013,6 +1238,9 @@ class Runner:
                             loss_smooth.item() if isinstance(loss_smooth, torch.Tensor) else 0.0,
                             loss_reg.item() if isinstance(loss_reg, torch.Tensor) else 0.0,
                             loss_curriculum.item() if isinstance(loss_curriculum, torch.Tensor) else 0.0,
+                            loss_reflect.item() if isinstance(loss_reflect, torch.Tensor) else 0.0,
+                            loss_illum_smooth.item() if isinstance(loss_illum_smooth, torch.Tensor) else 0.0,
+                            loss_vis_smooth.item() if isinstance(loss_vis_smooth, torch.Tensor) else 0.0,
                             current_exposure if current_exposure is not None else 0.0,
                             len(self.splats["means"]),
                             mem,
@@ -1050,6 +1278,17 @@ class Runner:
                             data["perturbation_mlp"] = self.perturbation_mlp.module.state_dict()
                         else:
                             data["perturbation_mlp"] = self.perturbation_mlp.state_dict()
+                    if cfg.enable_intrinsic_factorization:
+                        if self.illumination_mlp is not None:
+                            if world_size > 1:
+                                data["illumination_mlp"] = self.illumination_mlp.module.state_dict()
+                            else:
+                                data["illumination_mlp"] = self.illumination_mlp.state_dict()
+                        if self.visibility_mlp is not None:
+                            if world_size > 1:
+                                data["visibility_mlp"] = self.visibility_mlp.module.state_dict()
+                            else:
+                                data["visibility_mlp"] = self.visibility_mlp.state_dict()
                     torch.save(
                         data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                     )
@@ -1132,6 +1371,13 @@ class Runner:
                 if cfg.enable_multi_exposure and self.mlp_optimizer is not None:
                     self.mlp_optimizer.step()
                     self.mlp_optimizer.zero_grad(set_to_none=True)
+                if cfg.enable_intrinsic_factorization:
+                    if self.illumination_mlp_optimizer is not None:
+                        self.illumination_mlp_optimizer.step()
+                        self.illumination_mlp_optimizer.zero_grad(set_to_none=True)
+                    if self.visibility_mlp_optimizer is not None:
+                        self.visibility_mlp_optimizer.step()
+                        self.visibility_mlp_optimizer.zero_grad(set_to_none=True)
                 for scheduler in schedulers:
                     scheduler.step()
 

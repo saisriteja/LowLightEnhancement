@@ -79,3 +79,117 @@ class PerturbationMLP(nn.Module):
         
         return torch.cat([delta_c, delta_alpha, delta_sigma], dim=-1)  # [N, 5]
 
+
+class IlluminationMLP(nn.Module):
+    """
+    MLP that outputs illumination multiplier L(e) as a function of exposure.
+    
+    Input: exposure_normalized (1D) 
+    Output: L(e) ∈ ℝ³ (RGB illumination multiplier)
+    
+    Property: L(exposure=0) = [1, 1, 1] to fix scale ambiguity
+    Smooth function: d²(log L)/de² ≈ 0
+    
+    Args:
+        hidden_dim: Hidden dimension for MLP layers (default: 32)
+    """
+    
+    def __init__(self, hidden_dim: int = 32):
+        super().__init__()
+        
+        # Input: exposure_normalized (1D)
+        self.fc1 = nn.Linear(1, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 3)  # Output RGB illumination
+        
+        # Initialize to output [1, 1, 1] at exposure=0
+        # This fixes the scale ambiguity: L(0) = [1, 1, 1]
+        nn.init.zeros_(self.fc_out.weight)
+        nn.init.zeros_(self.fc_out.bias)
+        # Bias should be such that tanh(0) * scale + offset = 1
+        # We'll use sigmoid activation, so initialize bias to logit(1) = large positive
+        # Actually, let's use a different approach: output = 1 + tanh(...) * scale
+        # This ensures output is always positive and starts at 1
+        
+    def forward(self, exposure_normalized: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            exposure_normalized: [N_G, 1] or [1, 1] - Normalized exposure in [-1, 1]
+        
+        Returns:
+            illumination: [N_G, 3] or [1, 3] - RGB illumination multiplier L(e)
+        """
+        # Forward through MLP
+        x = F.relu(self.fc1(exposure_normalized))
+        x = F.relu(self.fc2(x))
+        out = self.fc_out(x)  # [N, 3]
+        
+        # Ensure positive output: use softplus or sigmoid-based activation
+        # L(e) = 1 + tanh(out) * scale ensures L(0) ≈ 1 when out ≈ 0
+        # But we want L(0) = 1 exactly, so we'll use: L(e) = 1 + tanh(out) * (exp(scale) - 1)
+        # Actually simpler: L(e) = exp(tanh(out)) ensures L(0) = 1
+        # Or: L(e) = 1 + tanh(out) ensures L ∈ [0, 2] and L(0) = 1
+        
+        # Use sigmoid-based activation to ensure positive outputs
+        # L(e) = 1 + 2 * sigmoid(out) - 1 = 1 + 2 * (sigmoid(out) - 0.5)
+        # This gives L ∈ [0, 2] with L(0) ≈ 1 when out ≈ 0
+        # Better: L(e) = 0.5 + 1.5 * sigmoid(out) gives L ∈ [0.5, 2]
+        # Or simplest: L(e) = exp(tanh(out)) gives L ∈ [1/e, e] ≈ [0.37, 2.72]
+        
+        # Use: L(e) = 1 + tanh(out) * scale_factor
+        # This ensures L(0) = 1 and L ∈ [1-scale, 1+scale]
+        # For scale_factor = 1, L ∈ [0, 2]
+        illumination = 1.0 + torch.tanh(out) * 1.0  # L ∈ [0, 2], L(0) = 1
+        
+        return illumination
+
+
+class VisibilityMLP(nn.Module):
+    """
+    MLP that outputs visibility multiplier V(view) as a function of view direction.
+    
+    Input: view_dir (2D spherical coordinates)
+    Output: V(view) ∈ ℝ³ (RGB visibility multiplier)
+    
+    Property: Smooth function of view direction
+    Initialize to output [1, 1, 1] (no occlusion initially)
+    
+    Args:
+        hidden_dim: Hidden dimension for MLP layers (default: 32)
+    """
+    
+    def __init__(self, hidden_dim: int = 32):
+        super().__init__()
+        
+        # Input: view_dir (2D spherical coordinates)
+        self.fc1 = nn.Linear(2, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 3)  # Output RGB visibility
+        
+        # Initialize to output [1, 1, 1] (no occlusion initially)
+        nn.init.zeros_(self.fc_out.weight)
+        nn.init.zeros_(self.fc_out.bias)
+        
+    def forward(self, view_dir: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            view_dir: [N_G, 2] or [1, 2] - View directions in spherical coords (theta, phi)
+        
+        Returns:
+            visibility: [N_G, 3] or [1, 3] - RGB visibility multiplier V(view)
+        """
+        # Forward through MLP
+        x = F.relu(self.fc1(view_dir))
+        x = F.relu(self.fc2(x))
+        out = self.fc_out(x)  # [N, 3]
+        
+        # Ensure positive output: use sigmoid-based activation
+        # V(view) = 1 + tanh(out) ensures V ∈ [0, 2] and V(0) ≈ 1
+        visibility = 1.0 + torch.tanh(out) * 0.5  # V ∈ [0.5, 1.5], V(0) ≈ 1
+        
+        return visibility
+
