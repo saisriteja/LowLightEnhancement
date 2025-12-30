@@ -175,7 +175,7 @@
 
 
 DATA_ROOT=/mnt/data0/teja/lowlight/LowLightEnhancement/dataset/LOM_full
-RESULT_ROOT=./results
+RESULT_ROOT=./results_stable
 
 for SCENE in bike buu chair shrub sofa; do
     CUDA_VISIBLE_DEVICES=1,3 python simple_trainer.py default \
