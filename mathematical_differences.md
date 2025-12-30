@@ -201,7 +201,7 @@ where:
 
 #### Illumination Smoothness Loss
 $$
-\mathcal{L}_{\text{illum\_smooth}} = \lambda_{\text{illum\_smooth}} \cdot \left\| \frac{\partial^2 \log L(e)}{\partial e^2} \right\|^2
+\mathcal{L}_{\text{illum-smooth}} = \lambda_{\text{illum-smooth}} \cdot \left\| \frac{\partial^2 \log L(e)}{\partial e^2} \right\|^2
 $$
 
 where the second derivative is approximated via finite differences:
@@ -210,36 +210,36 @@ $$
 $$
 
 with:
-- $\lambda_{\text{illum\_smooth}} = 1.0$ = Loss weight (default)
+- $\lambda_{\text{illum-smooth}} = 1.0$ = Loss weight (default)
 
 **Purpose**: Ensures illumination changes smoothly with exposure.
 
 #### Visibility Smoothness Loss
 $$
-\mathcal{L}_{\text{vis\_smooth}} = \lambda_{\text{vis\_smooth}} \cdot \frac{1}{N_{\text{pairs}}} \sum_{(\mathbf{v}_a, \mathbf{v}_b)} \exp(-d_{ab}) \cdot \|V(\mathbf{v}_a) - V(\mathbf{v}_b)\|^2
+\mathcal{L}_{\text{vis-smooth}} = \lambda_{\text{vis-smooth}} \cdot \frac{1}{N_{\text{pairs}}} \sum_{(\mathbf{v}_a, \mathbf{v}_b)} \exp(-d_{ab}) \cdot \|V(\mathbf{v}_a) - V(\mathbf{v}_b)\|^2
 $$
 
 where:
 - $d_{ab}$ = Distance between view directions $\mathbf{v}_a$ and $\mathbf{v}_b$
-- $\lambda_{\text{vis\_smooth}} = 0.1$ = Loss weight (default)
+- $\lambda_{\text{vis-smooth}} = 0.1$ = Loss weight (default)
 
 **Purpose**: Encourages smooth visibility changes for nearby views.
 
 #### Reflectance Spatial Smoothness Loss
 $$
-\mathcal{L}_{\text{reflect\_spatial}} = \lambda_{\text{reflect\_spatial}} \cdot \frac{1}{N_G} \sum_{n} \frac{1}{K} \sum_{k \in \mathcal{N}_n} \|R_n - R_k\|^2
+\mathcal{L}_{\text{reflect-spatial}} = \lambda_{\text{reflect-spatial}} \cdot \frac{1}{N_G} \sum_{n} \frac{1}{K} \sum_{k \in \mathcal{N}_n} \|R_n - R_k\|^2
 $$
 
 where:
 - $\mathcal{N}_n$ = Set of $K$ nearest neighbors of Gaussian $n$
 - $R_n$ = Reflectance of Gaussian $n$
-- $\lambda_{\text{reflect\_spatial}} = 1.0$ = Loss weight (default)
+- $\lambda_{\text{reflect-spatial}} = 1.0$ = Loss weight (default)
 
 **Purpose**: Enforces spatial smoothness on reflectance, ensuring neighboring Gaussians have similar material properties.
 
 #### Total Loss (Lowlight Enhancement Trainer)
 $$
-\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{photo}} + \mathcal{L}_{\text{structure}} + \mathcal{L}_{\text{consist}} + \mathcal{L}_{\text{smooth}} + \mathcal{L}_{\text{reg}} + \mathcal{L}_{\text{curriculum}} + \mathcal{L}_{\text{reflect}} + \mathcal{L}_{\text{illum\_smooth}} + \mathcal{L}_{\text{vis\_smooth}} + \mathcal{L}_{\text{reflect\_spatial}}
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{photo}} + \mathcal{L}_{\text{structure}} + \mathcal{L}_{\text{consist}} + \mathcal{L}_{\text{smooth}} + \mathcal{L}_{\text{reg}} + \mathcal{L}_{\text{curriculum}} + \mathcal{L}_{\text{reflect}} + \mathcal{L}_{\text{illum-smooth}} + \mathcal{L}_{\text{vis-smooth}} + \mathcal{L}_{\text{reflect-spatial}}
 $$
 
 where each term is only included if its corresponding flag is enabled and weight > 0.
