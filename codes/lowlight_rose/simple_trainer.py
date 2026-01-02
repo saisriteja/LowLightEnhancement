@@ -1,9 +1,6 @@
 import sys
-import os
-# Add gsplat examples to path BEFORE any imports
-_gsplat_examples_path = "/mnt/data0/teja/lowlight/LowLightEnhancement/codes/gsplat/examples"
-if _gsplat_examples_path not in sys.path:
-    sys.path.insert(0, _gsplat_examples_path)
+sys.path.append('/mnt/data0/teja/lowlight/LowLightEnhancement/codes/gsplat/examples/')
+
 import csv
 import json
 import math
@@ -36,25 +33,6 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
-
-# Multi-exposure imports
-from perturbation_mlp import PerturbationMLP, IlluminationMLP, VisibilityMLP
-from losses import (
-    compute_exposure_consistency_loss,
-    compute_smoothness_loss,
-    compute_regularization_loss,
-    compute_reflectance_consistency_loss,
-    compute_illumination_smoothness_loss,
-    compute_visibility_smoothness_loss,
-    compute_structure_loss,
-    compute_reflectance_spatial_smoothness_loss,
-)
-# Import multi-exposure utils functions from exposure_utils.py
-from exposure_utils import (
-    compute_view_directions,
-    normalize_exposure,
-    get_curriculum_exposure,
-)
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -213,40 +191,29 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
-    # Multi-exposure Gaussian Splatting parameters
-    enable_multi_exposure: bool = True
-    perturbation_mlp_hidden_dim: int = 32
-    max_delta_c: float = 0.1  # Reduced from 0.5
-    max_delta_alpha: float = 0.05  # Reduced from 0.25
-    max_delta_sigma: float = 0.05  # Reduced from 0.1
-    lambda_consist: float = 5.0  # Increased from 0.5
-    lambda_smooth: float = 10.0  # Increased from 0.1
-    lambda_reg: float = 0.01  # Increased from 1e-4
-    lambda_structure: float = 2.0  # NEW - gradient/edge loss weight
-    lambda_curriculum_init: float = 10.0
-    curriculum_decay_tau: int = 300
-    mlp_lr: float = 1e-4
-    exposure_curriculum_phases: List[int] = field(default_factory=lambda: [3000, 10000, 20000])  # Multiplied by 10x
-    exposure_range_per_phase: List[float] = field(default_factory=lambda: [1.0, 2.0, 3.0])
-    consist_loss_freq: int = 1  # Compute every step (was 3)
-
-    # Intrinsic factorization parameters
-    enable_intrinsic_factorization: bool = True
-    illumination_mlp_hidden_dim: int = 32
-    visibility_mlp_hidden_dim: int = 32
-    lambda_reflect: float = 10.0  # Increased from 1.0
-    lambda_illum_smooth: float = 1.0  # Increased from 0.1
-    lambda_vis_smooth: float = 0.1
-    lambda_reflect_spatial: float = 1.0  # NEW - spatial smoothness on reflectance
-    illumination_mlp_lr: float = 1e-4
-    visibility_mlp_lr: float = 1e-4
-    reflect_loss_freq: int = 5  # Compute reflectance consistency loss every N steps
-
-    # Debug output and MLP control parameters
-    debug_save_interval: int = 5000  # Interval for saving debug outputs (0 to disable)
-    debug_disable_perturbation_mlp: bool = False  # Disable perturbation MLP for debugging
-    debug_disable_illumination_mlp: bool = False  # Disable illumination MLP for debugging
-    debug_disable_visibility_mlp: bool = False  # Disable visibility MLP for debugging
+    # ============================================================================
+    # RoSe Low-Light Enhancement Parameters
+    # ============================================================================
+    # Master flag - enable RoSe mode (default: False, set to True to enable all RoSe features)
+    enable_rose: bool = False
+    
+    # Core RoSe Parameters
+    illuminance_lr: float = 1e-3  # Learning rate for illuminance parameters
+    lambda_ic: float = 1e-3  # Weight for illumination correction loss
+    lambda_lr: float = 1e-4  # Weight for low-rank regularization loss
+    target_illumination: float = 0.45  # Target mean illumination level
+    geometry_warmup_steps: int = 2000  # Steps for Phase 1 training
+    illuminance_min: float = 0.1  # Minimum illuminance value
+    illuminance_max: float = 1.5  # Maximum illuminance value
+    epsilon_tone: float = 1e-6  # Small epsilon for inverse tone curve
+    knn_neighbors: int = 8  # Number of neighbors for low-rank loss
+    
+    # Ablation Study Flags (all default to True when enable_rose=True)
+    enable_inverse_tone_curve: bool = True  # Apply inverse tone curve to GT
+    enable_illumination_correction: bool = True  # Enable illumination correction loss
+    enable_low_rank_reg: bool = True  # Enable low-rank regularization loss
+    enable_two_phase_training: bool = False  # Enable two-phase training schedule
+    enable_illuminance_constraint: bool = True  # Apply illuminance range constraint [0.1, 1.5]
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -267,6 +234,70 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+
+def inverse_tone_curve(x: Tensor, epsilon: float = 1e-6) -> Tensor:
+    """
+    Apply inverse tone curve: φ(x) = 0.5 - sin(sin⁻¹(1-2x)/3)
+    
+    Dark pixels have weak gradients → rebalance them using this transformation.
+    
+    Args:
+        x: Input tensor in [0, 1]
+        epsilon: Small value to avoid numerical issues
+    
+    Returns:
+        Processed tensor
+    """
+    x_clamped = torch.clamp(x + epsilon, 0.0, 1.0)
+    inner = torch.asin(1.0 - 2.0 * x_clamped) / 3.0
+    return 0.5 - torch.sin(inner)
+
+
+def compute_low_rank_loss(
+    illuminances: Tensor,
+    means: Tensor,
+    k: int = 8,
+    enable_flag: bool = True,
+) -> Tensor:
+    """
+    Compute low-rank regularization loss using KNN neighbors.
+    
+    Illumination is smooth and spatially correlated (low-rank), while noise is high-rank.
+    This loss encourages neighboring Gaussians to have similar illuminance values.
+    
+    Args:
+        illuminances: Illuminance values [N,]
+        means: Gaussian means [N, 3]
+        k: Number of neighbors
+        enable_flag: Whether to compute loss (for ablation)
+    
+    Returns:
+        Loss value (0 if disabled)
+    """
+    if not enable_flag:
+        return torch.tensor(0.0, device=illuminances.device, dtype=illuminances.dtype)
+    
+    # Detach means for KNN computation (we only need spatial structure, not gradients)
+    means_detached = means.detach()
+    
+    # Get k nearest neighbors for each Gaussian using sklearn directly
+    # (knn function only returns distances, we need indices)
+    from sklearn.neighbors import NearestNeighbors
+    means_np = means_detached.cpu().numpy()
+    model = NearestNeighbors(n_neighbors=k + 1, metric="euclidean").fit(means_np)
+    distances_np, indices_np = model.kneighbors(means_np)
+    indices = torch.from_numpy(indices_np).to(illuminances.device)  # [N, k+1]
+    
+    neighbor_indices = indices[:, 1:]  # Exclude self [N, k]
+    
+    # Get illuminance values for neighbors
+    neighbor_illuminances = illuminances[neighbor_indices]  # [N, k]
+    current_illuminances = illuminances.unsqueeze(-1)  # [N, 1]
+    
+    # Compute squared differences
+    diff = (current_illuminances - neighbor_illuminances) ** 2
+    return diff.mean()
 
 
 def create_splats_with_optimizers(
@@ -291,6 +322,10 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    enable_rose: bool = False,
+    illuminance_lr: float = 1e-3,
+    illuminance_min: float = 0.1,
+    illuminance_max: float = 1.5,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -325,26 +360,36 @@ def create_splats_with_optimizers(
 
     if feature_dim is None:
         # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
+        if enable_rose:
+            # For RoSe: initialize normal-light colors from mean observed color
+            mean_rgb = rgbs.mean(dim=0, keepdim=True)  # [1, 3]
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = rgb_to_sh(mean_rgb.expand(N, -1))  # Initialize all to mean
+        else:
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-        # Add reflectance parameter initialized from RGB colors
-        # Reflectance R is the intrinsic material property
-        # Use much lower learning rate to prevent compensation for illumination changes
-        reflectance_init = rgbs  # [N, 3] - initialize from RGB colors
-        reflectance_lr = sh0_lr * 0.01  # 100x lower LR to prevent compensation
-        params.append(("reflectance", torch.nn.Parameter(reflectance_init), reflectance_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
+        if enable_rose:
+            # For RoSe: initialize normal-light colors from mean observed color
+            mean_rgb = rgbs.mean(dim=0)  # [3]
+            colors = torch.logit(mean_rgb.unsqueeze(0).expand(N, -1))  # [N, 3]
+        else:
+            colors = torch.logit(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
-        # Add reflectance for feature-based mode too
-        reflectance_init = rgbs  # [N, 3]
-        reflectance_lr = sh0_lr * 0.01  # 100x lower LR to prevent compensation
-        params.append(("reflectance", torch.nn.Parameter(reflectance_init), reflectance_lr))
+
+    # Add illuminance parameters for RoSe
+    if enable_rose:
+        # Initialize illuminance to 1.0: i_i = illuminance_min + (illuminance_max - illuminance_min) * sigmoid(raw)
+        # To get 1.0: sigmoid(raw) = (1.0 - illuminance_min) / (illuminance_max - illuminance_min)
+        # raw = logit((1.0 - illuminance_min) / (illuminance_max - illuminance_min))
+        target_sigmoid = (1.0 - illuminance_min) / (illuminance_max - illuminance_min)
+        illuminances_raw = torch.logit(torch.full((N,), target_sigmoid))  # [N,]
+        params.append(("illuminances", torch.nn.Parameter(illuminances_raw), illuminance_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -398,90 +443,36 @@ class Runner:
         os.makedirs(self.render_dir, exist_ok=True)
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
-        self.debug_dir = f"{cfg.result_dir}/debug"
-        os.makedirs(self.debug_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
-        # CSV logging setup
-        self.csv_file_handle = None
-        self.csv_writer = None
+        # Setup CSV logging for losses
+        self.loss_log_dir = f"{cfg.result_dir}/loss_logs"
+        os.makedirs(self.loss_log_dir, exist_ok=True)
         if world_rank == 0:
-            csv_file = f"{cfg.result_dir}/losses.csv"
-            self.csv_file_handle = open(csv_file, "w", newline="")
-            self.csv_writer = csv.writer(self.csv_file_handle)
-            # Write header row
-            self.csv_writer.writerow([
-                "step",
-                "loss_total",
-                "loss_photo",
-                "loss_consist",
-                "loss_smooth",
-                "loss_reg",
-                "loss_curriculum",
-                "loss_structure",
-                "loss_reflect",
-                "loss_illum_smooth",
-                "loss_vis_smooth",
-                "loss_reflect_spatial",
-                "exposure_ev",
-                "num_GS",
-                "mem",
-            ])
-            self.csv_file_handle.flush()
-
-        # Multi-exposure setup
-        self.perturbation_mlp = None
-        self.mlp_optimizer = None
-        if cfg.enable_multi_exposure:
-            self.perturbation_mlp = PerturbationMLP(
-                hidden_dim=cfg.perturbation_mlp_hidden_dim,
-                max_delta_c=cfg.max_delta_c,
-                max_delta_alpha=cfg.max_delta_alpha,
-                max_delta_sigma=cfg.max_delta_sigma,
-            ).to(self.device)
-            if world_size > 1:
-                self.perturbation_mlp = DDP(self.perturbation_mlp)
-            self.mlp_optimizer = torch.optim.Adam(
-                self.perturbation_mlp.parameters(),
-                lr=cfg.mlp_lr * math.sqrt(cfg.batch_size),
-            )
-
-        # Intrinsic factorization setup
-        self.illumination_mlp = None
-        self.visibility_mlp = None
-        self.illumination_mlp_optimizer = None
-        self.visibility_mlp_optimizer = None
-        if cfg.enable_intrinsic_factorization:
-            self.illumination_mlp = IlluminationMLP(
-                hidden_dim=cfg.illumination_mlp_hidden_dim,
-            ).to(self.device)
-            self.visibility_mlp = VisibilityMLP(
-                hidden_dim=cfg.visibility_mlp_hidden_dim,
-            ).to(self.device)
-            
-            if world_size > 1:
-                self.illumination_mlp = DDP(self.illumination_mlp)
-                self.visibility_mlp = DDP(self.visibility_mlp)
-            
-            self.illumination_mlp_optimizer = torch.optim.Adam(
-                self.illumination_mlp.parameters(),
-                lr=cfg.illumination_mlp_lr * math.sqrt(cfg.batch_size),
-            )
-            self.visibility_mlp_optimizer = torch.optim.Adam(
-                self.visibility_mlp.parameters(),
-                lr=cfg.visibility_mlp_lr * math.sqrt(cfg.batch_size),
-            )
-            
-            # Initialize L(exposure=0) = [1, 1, 1] constraint
-            # This is already handled in IlluminationMLP initialization, but we verify it
-            with torch.no_grad():
-                zero_exposure = torch.zeros((1, 1), device=self.device)
-                L_zero = self.illumination_mlp.module if world_size > 1 else self.illumination_mlp
-                L_zero_val = L_zero(zero_exposure)
-                if world_rank == 0:
-                    print(f"Initialized IlluminationMLP: L(0) = {L_zero_val.squeeze().cpu().numpy()}")
+            self.loss_csv_path = f"{self.loss_log_dir}/losses_step_by_step.csv"
+            self.loss_csv_file = open(self.loss_csv_path, 'w', newline='')
+            self.loss_csv_writer = csv.writer(self.loss_csv_file)
+            # Write CSV header
+            header = [
+                'step', 'total_loss',
+                'reconstruction_loss', 'l1_loss', 'l2_loss', 'ssim_loss',
+                'ic_loss_raw', 'ic_loss_weighted', 'lambda_ic',
+                'lr_loss_raw', 'lr_loss_weighted', 'lambda_lr',
+                'depth_loss_raw', 'depth_loss_weighted', 'depth_lambda',
+                'tv_loss', 'opacity_reg_loss', 'scale_reg_loss',
+                'illuminance_mean', 'illuminance_std', 'illuminance_min', 'illuminance_max',
+                'colors_nor_mean', 'colors_mean',
+                'recon_contrib_pct', 'ic_contrib_pct', 'lr_contrib_pct', 'depth_contrib_pct',
+                'phase'
+            ]
+            self.loss_csv_writer.writerow(header)
+            self.loss_csv_file.flush()
+            print(f"Loss logging initialized. CSV will be saved to: {self.loss_csv_path}")
+        else:
+            self.loss_csv_writer = None
+            self.loss_csv_file = None
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
@@ -524,8 +515,31 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            enable_rose=cfg.enable_rose,
+            illuminance_lr=cfg.illuminance_lr,
+            illuminance_min=cfg.illuminance_min,
+            illuminance_max=cfg.illuminance_max,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        # Debug logging for RoSe configuration
+        if world_rank == 0:
+            print("=" * 60)
+            print("RoSe Configuration:")
+            print(f"  RoSe Enabled: {cfg.enable_rose}")
+            if cfg.enable_rose:
+                print(f"  Inverse Tone Curve: {cfg.enable_inverse_tone_curve}")
+                print(f"  Illumination Correction: {cfg.enable_illumination_correction}")
+                print(f"  Low-Rank Regularization: {cfg.enable_low_rank_reg}")
+                print(f"  Two-Phase Training: {cfg.enable_two_phase_training}")
+                print(f"  Illuminance Constraint: {cfg.enable_illuminance_constraint}")
+                print(f"  Lambda IC: {cfg.lambda_ic}")
+                print(f"  Lambda LR: {cfg.lambda_lr}")
+                print(f"  Geometry Warmup Steps: {cfg.geometry_warmup_steps}")
+                print(f"  Target Illumination: {cfg.target_illumination}")
+                if "illuminances" in self.splats:
+                    print(f"  Illuminance Parameters: {len(self.splats['illuminances'])}")
+            print("=" * 60)
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -641,7 +655,6 @@ class Runner:
         masks: Optional[Tensor] = None,
         rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
-        exposure_ev: Optional[float] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -652,6 +665,8 @@ class Runner:
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
+        enable_rose = self.cfg.enable_rose
+        
         if self.cfg.app_opt:
             colors = self.app_module(
                 features=self.splats["features"],
@@ -664,172 +679,116 @@ class Runner:
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
-        # Apply intrinsic factorization: I = R ⊙ L(e) ⊙ V(view)
-        # During training: use reflectance-based factorization (for gradients)
-        # During inference: skip this and use direct exposure scaling instead (to avoid compensation)
-        L_e_applied = None
-        V_view_applied = None
-        
-        # Only apply reflectance-based factorization during training (when gradients are enabled)
-        apply_reflectance_factorization = torch.is_grad_enabled()
-        
-        if (
-            exposure_ev is not None
-            and self.cfg.enable_intrinsic_factorization
-            and not self.cfg.debug_disable_illumination_mlp
-            and not self.cfg.debug_disable_visibility_mlp
-            and self.illumination_mlp is not None
-            and self.visibility_mlp is not None
-            and "reflectance" in self.splats
-            and apply_reflectance_factorization  # Only during training
-        ):
-            N_G = means.shape[0]
-            reflectance = self.splats["reflectance"]  # [N_G, 3]
-            
-            # Normalize exposure
-            exposure_norm = torch.clamp(
-                torch.tensor(exposure_ev / 2.0, device=self.device), -1, 1
-            )
-            exposure_norm_expanded = exposure_norm.unsqueeze(0).repeat(N_G, 1)  # [N_G, 1]
-            
-            # Compute view directions
-            view_dirs = compute_view_directions(means, camtoworlds)  # [N_G, 2]
-            
-            # Get L(e) and V(view) - handle debug flags
-            if self.cfg.debug_disable_illumination_mlp:
-                L_e = torch.ones((N_G, 3), device=self.device)  # [N_G, 3] - no illumination change
-            else:
-                if self.world_size > 1:
-                    L_e = self.illumination_mlp.module(exposure_norm_expanded)  # [N_G, 3]
-                else:
-                    L_e = self.illumination_mlp(exposure_norm_expanded)  # [N_G, 3]
-                
-                # Track exposure for debug (no printing to avoid clutter)
-                if not hasattr(self, '_last_exposure_debug'):
-                    self._last_exposure_debug = exposure_ev
-            
-            if self.cfg.debug_disable_visibility_mlp:
-                V_view = torch.ones((N_G, 3), device=self.device)  # [N_G, 3] - no visibility change
-            else:
-                if self.world_size > 1:
-                    V_view = self.visibility_mlp.module(view_dirs)  # [N_G, 3]
-                else:
-                    V_view = self.visibility_mlp(view_dirs)  # [N_G, 3]
-            
-            # Store for application after rasterization (to avoid reflectance compensation)
-            L_e_applied = L_e
-            V_view_applied = V_view
-            
-            # Apply factorization: colors_intrinsic = R ⊙ L(e) ⊙ V(view)
-            # For SH colors, apply to band 0 (RGB base color)
-            colors_intrinsic_band0 = reflectance.unsqueeze(1) * L_e.unsqueeze(1) * V_view.unsqueeze(1)  # [N_G, 1, 3]
-            
-            # Track debug flag (no printing to avoid clutter)
-            if not hasattr(self, '_debug_colors_printed'):
-                self._debug_colors_printed = True
-            
-            # Combine with higher-order SH bands (view-dependent effects)
-            if colors.shape[1] > 1:
-                colors = torch.cat([colors_intrinsic_band0, colors[:, 1:, :]], dim=1)  # [N, K, 3]
-            else:
-                colors = colors_intrinsic_band0  # [N, 1, 3]
-
-        # Apply exposure-dependent perturbations if enabled
-        if (
-            exposure_ev is not None
-            and self.cfg.enable_multi_exposure
-            and not self.cfg.debug_disable_perturbation_mlp
-            and self.perturbation_mlp is not None
-        ):
-            # Normalize exposure
-            exposure_norm = torch.clamp(
-                torch.tensor(exposure_ev / 2.0, device=self.device), -1, 1
-            )
-            
-            # Compute view directions
-            view_dirs = compute_view_directions(means, camtoworlds)  # [N, 2]
-            
-            # Expand exposure to match number of Gaussians
-            N_G = means.shape[0]
-            exposure_norm_expanded = exposure_norm.unsqueeze(0).repeat(N_G, 1)  # [N_G, 1]
-            
-            # Get perturbations
-            if self.world_size > 1:
-                perturbations = self.perturbation_mlp.module(
-                    means, view_dirs, exposure_norm_expanded
-                )  # [N_G, 5]
-            else:
-                perturbations = self.perturbation_mlp(
-                    means, view_dirs, exposure_norm_expanded
-                )  # [N_G, 5]
-            
-            # Extract deltas
-            delta_c = perturbations[:, :3]  # [N_G, 3] RGB perturbation
-            delta_alpha = perturbations[:, 3:4]  # [N_G, 1]
-            delta_sigma = perturbations[:, 4:5]  # [N_G, 1]
-            
-            # Apply perturbations to opacities and scales (clone first to avoid in-place ops)
-            # Clone to ensure we're working with new tensors, not views
-            opacities = torch.clamp(opacities.clone() + delta_alpha.squeeze(-1), 0, 1)  # [N]
-            scales = (scales.clone() * ((1.0 + delta_sigma) ** 2))  # [N, 3]
-            
-            # Apply perturbations to colors (create new tensor to avoid in-place modification)
-            # For SH colors, apply multiplicative perturbation to SH band 0 (RGB)
-            # This affects the base color while preserving view-dependent effects
-            # Create new tensor by concatenating modified band 0 with unchanged higher bands
-            # Use detach and clone to ensure we're creating a new tensor
-            colors_band0_perturbed = (colors[:, 0:1, :] * (1.0 + delta_c.unsqueeze(1))).clone()  # [N, 1, 3]
-            if colors.shape[1] > 1:
-                colors = torch.cat([colors_band0_perturbed, colors[:, 1:, :].clone()], dim=1)  # [N, K, 3]
-            else:
-                colors = colors_band0_perturbed  # [N, 1, 3]
-
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
-        render_colors, render_alphas, info = rasterization(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-            Ks=Ks,  # [C, 3, 3]
-            width=width,
-            height=height,
-            packed=self.cfg.packed,
-            absgrad=(
-                self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
-                else False
-            ),
-            sparse_grad=self.cfg.sparse_grad,
-            rasterize_mode=rasterize_mode,
-            distributed=self.world_size > 1,
-            camera_model=self.cfg.camera_model,
-            with_ut=self.cfg.with_ut,
-            with_eval3d=self.cfg.with_eval3d,
-            **kwargs,
-        )
+
+        # Handle RoSe illuminance rendering
+        if enable_rose and "illuminances" in self.splats:
+            # Apply illuminance constraint: i_i = min + (max - min) * sigmoid(raw)
+            if self.cfg.enable_illuminance_constraint:
+                illuminances = (
+                    self.cfg.illuminance_min
+                    + (self.cfg.illuminance_max - self.cfg.illuminance_min)
+                    * torch.sigmoid(self.splats["illuminances"])
+                )  # [N,]
+            else:
+                illuminances = torch.sigmoid(self.splats["illuminances"])  # [N,]
+            
+            # Render normal-light colors
+            render_colors_nor, render_alphas, info = rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                Ks=Ks,  # [C, 3, 3]
+                width=width,
+                height=height,
+                packed=self.cfg.packed,
+                absgrad=(
+                    self.cfg.strategy.absgrad
+                    if isinstance(self.cfg.strategy, DefaultStrategy)
+                    else False
+                ),
+                sparse_grad=self.cfg.sparse_grad,
+                rasterize_mode=rasterize_mode,
+                distributed=self.world_size > 1,
+                camera_model=self.cfg.camera_model,
+                with_ut=self.cfg.with_ut,
+                with_eval3d=self.cfg.with_eval3d,
+                **kwargs,
+            )
+            
+            # Render illuminance using same weights (create dummy color tensor with illuminance as RGB)
+            # illuminances: [N,] -> colors_illum: [N, K, 3] where all channels are illuminance
+            illuminances_expanded = illuminances.unsqueeze(-1).unsqueeze(-1)  # [N, 1, 1]
+            colors_illum = illuminances_expanded.expand(-1, colors.shape[1], 3)  # [N, K, 3]
+            
+            render_illuminance_rgb, _, _ = rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors_illum,
+                viewmats=torch.linalg.inv(camtoworlds),
+                Ks=Ks,
+                width=width,
+                height=height,
+                packed=self.cfg.packed,
+                absgrad=(
+                    self.cfg.strategy.absgrad
+                    if isinstance(self.cfg.strategy, DefaultStrategy)
+                    else False
+                ),
+                sparse_grad=self.cfg.sparse_grad,
+                rasterize_mode=rasterize_mode,
+                distributed=self.world_size > 1,
+                camera_model=self.cfg.camera_model,
+                with_ut=self.cfg.with_ut,
+                with_eval3d=self.cfg.with_eval3d,
+                **kwargs,
+            )
+            # Extract single channel from RGB (all channels are same)
+            render_illuminance = render_illuminance_rgb[..., 0:1]  # [C, H, W, 1]
+            
+            # Combine to get low-light rendering: C_low = C_nor ⊙ I
+            render_colors = render_colors_nor * render_illuminance  # [C, H, W, 3]
+            
+            # Store in info for later use
+            info["render_colors_nor"] = render_colors_nor
+            info["render_illuminance"] = render_illuminance
+        else:
+            # Standard 3DGS rendering
+            render_colors, render_alphas, info = rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                Ks=Ks,  # [C, 3, 3]
+                width=width,
+                height=height,
+                packed=self.cfg.packed,
+                absgrad=(
+                    self.cfg.strategy.absgrad
+                    if isinstance(self.cfg.strategy, DefaultStrategy)
+                    else False
+                ),
+                sparse_grad=self.cfg.sparse_grad,
+                rasterize_mode=rasterize_mode,
+                distributed=self.world_size > 1,
+                camera_model=self.cfg.camera_model,
+                with_ut=self.cfg.with_ut,
+                with_eval3d=self.cfg.with_eval3d,
+                **kwargs,
+            )
+        
         if masks is not None:
             render_colors[~masks] = 0
-        
-        # Apply direct exposure-based brightness scaling during inference only
-        # This is a simple, predictable enhancement that can't be compensated
-        if (exposure_ev is not None 
-            and not torch.is_grad_enabled() 
-            and self.cfg.enable_multi_exposure):
-            # Direct exposure-to-brightness mapping: brightness = 2^exposure_ev
-            # This matches how real cameras work: +1 EV = 2x brightness
-            exposure_brightness = 2.0 ** exposure_ev  # Simple, predictable scaling
-            
-            # Apply to rendered colors: multiply RGB channels
-            # render_colors shape: [C, H, W, channels] where channels can be 3 or 4
-            if render_colors.shape[-1] >= 3:
-                render_colors[..., 0:3] = render_colors[..., 0:3] * exposure_brightness
-                # Clamp to valid range
-                render_colors[..., 0:3] = torch.clamp(render_colors[..., 0:3], 0.0, 1.0)
         
         return render_colors, render_alphas, info
 
@@ -926,12 +885,14 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            # Exposure curriculum
-            current_exposure = None
-            if cfg.enable_multi_exposure:
-                current_exposure = get_curriculum_exposure(
-                    step, max_steps, cfg.exposure_curriculum_phases, cfg.exposure_range_per_phase
-                )
+            # Phase detection and illuminance gradient control
+            if cfg.enable_rose and cfg.enable_two_phase_training:
+                is_phase1 = step < cfg.geometry_warmup_steps
+                if "illuminances" in self.splats:
+                    self.splats["illuminances"].requires_grad = not is_phase1
+            elif cfg.enable_rose:
+                if "illuminances" in self.splats:
+                    self.splats["illuminances"].requires_grad = True
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -945,12 +906,19 @@ class Runner:
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
-                exposure_ev=current_exposure,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
+
+            # Extract normal-light colors and illuminance for RoSe
+            if cfg.enable_rose and "render_colors_nor" in info:
+                colors_nor = info["render_colors_nor"]  # [C, H, W, 3]
+                render_illuminance = info["render_illuminance"]  # [C, H, W, 1]
+            else:
+                colors_nor = colors
+                render_illuminance = None
 
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
@@ -978,215 +946,51 @@ class Runner:
                 info=info,
             )
 
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
+            # Apply inverse tone curve to GT (if enabled)
+            if cfg.enable_rose and cfg.enable_inverse_tone_curve:
+                pixels_processed = inverse_tone_curve(pixels, cfg.epsilon_tone)
+            else:
+                pixels_processed = pixels
+
+            # Reconstruction Loss (always computed)
+            l1loss = F.l1_loss(colors, pixels_processed)
             ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                colors.permute(0, 3, 1, 2), pixels_processed.permute(0, 3, 1, 2), padding="valid"
             )
-            loss_photo = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            loss = loss_photo
+            l2loss = F.mse_loss(colors, pixels_processed)
+            reconstruction_loss = l2loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            loss = reconstruction_loss
+            # RoSe-specific losses
+            ic_loss = torch.tensor(0.0, device=device)
+            lr_loss = torch.tensor(0.0, device=device)
+            # Initialize other losses
+            depthloss = torch.tensor(0.0, device=device)
+            tvloss = torch.tensor(0.0, device=device)
             
-            # Structure-preserving loss (gradient/edge loss)
-            loss_structure = torch.tensor(0.0, device=device)
-            if cfg.enable_multi_exposure and cfg.lambda_structure > 0:
-                loss_structure = compute_structure_loss(
-                    colors, pixels, lambda_weight=cfg.lambda_structure
-                )
-                loss += loss_structure
+            if cfg.enable_rose and cfg.enable_illumination_correction and colors_nor is not None:
+                # Illumination Correction Loss: L_IC = (mean(C_nor) - target)²
+                ic_loss = (colors_nor.mean() - cfg.target_illumination) ** 2
+                loss += cfg.lambda_ic * ic_loss
             
-            # Multi-exposure losses
-            loss_consist = torch.tensor(0.0, device=device)
-            loss_smooth = torch.tensor(0.0, device=device)
-            loss_reg = torch.tensor(0.0, device=device)
-            loss_curriculum = torch.tensor(0.0, device=device)
-            loss_reflect_spatial = torch.tensor(0.0, device=device)
-            
-            if cfg.enable_multi_exposure and self.perturbation_mlp is not None:
-                means = self.splats["means"]
-                view_dirs = compute_view_directions(means, camtoworlds)
-                
-                # Sample a subset of Gaussians for loss computation to speed up training
-                # Use all Gaussians for regularization (cheap), sample for expensive losses
-                N_G = means.shape[0]
-                max_samples = min(1000, N_G)  # Sample at most 1000 Gaussians
-                if N_G > max_samples:
-                    sample_indices = torch.randperm(N_G, device=device)[:max_samples]
-                    means_sample = means[sample_indices]
-                    view_dirs_sample = view_dirs[sample_indices]
-                else:
-                    means_sample = means
-                    view_dirs_sample = view_dirs
-                
-                # Consistency loss (periodic, uses sampled Gaussians)
-                if step % cfg.consist_loss_freq == 0:
-                    e1 = current_exposure
-                    e2 = current_exposure + 0.5
-                    # Create temporary ParameterDict with sampled means for consistency loss
-                    gaussians_sample = torch.nn.ParameterDict({"means": torch.nn.Parameter(means_sample)})
-                    loss_consist = compute_exposure_consistency_loss(
-                        gaussians_sample,
-                        self.perturbation_mlp.module if world_size > 1 else self.perturbation_mlp,
-                        [(e1, e2)],
-                        cfg.lambda_consist,
+            if cfg.enable_rose and cfg.enable_low_rank_reg and "illuminances" in self.splats:
+                # Low-Rank Regularization Loss
+                if self.cfg.enable_illuminance_constraint:
+                    illuminances = (
+                        self.cfg.illuminance_min
+                        + (self.cfg.illuminance_max - self.cfg.illuminance_min)
+                        * torch.sigmoid(self.splats["illuminances"])
                     )
-                    loss += loss_consist
+                else:
+                    illuminances = torch.sigmoid(self.splats["illuminances"])
                 
-                # Smoothness loss (uses sampled Gaussians)
-                loss_smooth = compute_smoothness_loss(
-                    self.perturbation_mlp.module if world_size > 1 else self.perturbation_mlp,
-                    means_sample,
-                    view_dirs_sample,
-                    [current_exposure],
-                    delta_e=0.2,
-                    lambda_weight=cfg.lambda_smooth,
+                lr_loss = compute_low_rank_loss(
+                    illuminances,
+                    self.splats["means"],
+                    k=cfg.knn_neighbors,
+                    enable_flag=True,
                 )
-                loss += loss_smooth
-                
-                # Regularization loss (can use all Gaussians as it's cheap - single forward pass)
-                exposure_norm = torch.clamp(
-                    torch.tensor(current_exposure / 2.0, device=device), -1, 1
-                )
-                exposure_norm_expanded = exposure_norm.unsqueeze(0).repeat(N_G, 1)
-                loss_reg = compute_regularization_loss(
-                    self.perturbation_mlp.module if world_size > 1 else self.perturbation_mlp,
-                    means,
-                    view_dirs,
-                    exposure_norm_expanded,
-                    lambda_weight=cfg.lambda_reg,
-                )
-                loss += loss_reg
-                
-                # Curriculum loss
-                lambda_curriculum = cfg.lambda_curriculum_init * math.exp(-step / cfg.curriculum_decay_tau)
-                loss_curriculum = torch.tensor(lambda_curriculum * (current_exposure - 0.0) ** 2, device=device)
-                loss += loss_curriculum
-                
-                # Intrinsic factorization losses
-                loss_reflect = torch.tensor(0.0, device=device)
-                loss_illum_smooth = torch.tensor(0.0, device=device)
-                loss_vis_smooth = torch.tensor(0.0, device=device)
-                
-                if cfg.enable_intrinsic_factorization and self.illumination_mlp is not None and self.visibility_mlp is not None and "reflectance" in self.splats:
-                    means = self.splats["means"]
-                    reflectance = self.splats["reflectance"]  # [N_G, 3]
-                    view_dirs = compute_view_directions(means, camtoworlds)  # [N_G, 2]
-                    
-                    # Sample a subset of Gaussians for loss computation
-                    N_G = means.shape[0]
-                    max_samples = min(500, N_G)
-                    if N_G > max_samples:
-                        sample_indices = torch.randperm(N_G, device=device)[:max_samples]
-                        means_sample = means[sample_indices]
-                        view_dirs_sample = view_dirs[sample_indices]
-                        reflectance_sample = reflectance[sample_indices]
-                    else:
-                        means_sample = means
-                        view_dirs_sample = view_dirs
-                        reflectance_sample = reflectance
-                    
-                    # Reflectance consistency loss (periodic, requires multiple observations)
-                    if step % cfg.reflect_loss_freq == 0 and step > 100 and current_exposure is not None:
-                        # Create synthetic observations with different exposures
-                        # Observation 1: current exposure
-                        e1 = current_exposure
-                        e2 = current_exposure + 0.5  # Different exposure
-                        
-                        # Normalize exposures
-                        e1_norm = torch.clamp(torch.tensor(e1 / 2.0, device=device), -1, 1)
-                        e2_norm = torch.clamp(torch.tensor(e2 / 2.0, device=device), -1, 1)
-                        e1_norm_expanded = e1_norm.unsqueeze(0).repeat(max_samples, 1)
-                        e2_norm_expanded = e2_norm.unsqueeze(0).repeat(max_samples, 1)
-                        
-                        # Get L(e) and V(view) for both exposures
-                        illum_mlp = self.illumination_mlp.module if world_size > 1 else self.illumination_mlp
-                        vis_mlp = self.visibility_mlp.module if world_size > 1 else self.visibility_mlp
-                        
-                        L_e1 = illum_mlp(e1_norm_expanded)  # [N_G, 3]
-                        L_e2 = illum_mlp(e2_norm_expanded)  # [N_G, 3]
-                        V_view = vis_mlp(view_dirs_sample)  # [N_G, 3]
-                        
-                        # Compute I_k = R ⊙ L(e_k) ⊙ V(view) for both exposures
-                        I1 = reflectance_sample * L_e1 * V_view  # [N_G, 3]
-                        I2 = reflectance_sample * L_e2 * V_view  # [N_G, 3]
-                        
-                        # Create observations list
-                        observations = [
-                            {'exposure_ev': e1, 'view_dir': view_dirs_sample, 'intensity': I1},
-                            {'exposure_ev': e2, 'view_dir': view_dirs_sample, 'intensity': I2},
-                        ]
-                        
-                        # Compute reflectance consistency loss
-                        loss_reflect = compute_reflectance_consistency_loss(
-                            illum_mlp,
-                            vis_mlp,
-                            observations,
-                            lambda_weight=cfg.lambda_reflect,
-                        )
-                        loss += loss_reflect
-                    
-                    # Illumination smoothness loss (compute periodically)
-                    if step % 2 == 0 and current_exposure is not None:
-                        illum_mlp = self.illumination_mlp.module if world_size > 1 else self.illumination_mlp
-                        loss_illum_smooth = compute_illumination_smoothness_loss(
-                            illum_mlp,
-                            [current_exposure],
-                            delta_e=0.1,
-                            lambda_weight=cfg.lambda_illum_smooth,
-                        )
-                        loss += loss_illum_smooth
-                    
-                    # Visibility smoothness loss (compute periodically, requires camera pairs)
-                    if step % 5 == 0:  # Less frequent since it requires camera pairs
-                        vis_mlp = self.visibility_mlp.module if world_size > 1 else self.visibility_mlp
-                        
-                        # Sample a nearby camera from the dataset for comparison
-                        # Use current camera and a nearby one (if available)
-                        try:
-                            # Get all camera poses
-                            all_camtoworlds = self.parser.camtoworlds
-                            current_cam_idx = image_ids[0].item() if image_ids is not None else 0
-                            
-                            # Find a nearby camera (next camera in sequence)
-                            if len(all_camtoworlds) > 1:
-                                next_cam_idx = (current_cam_idx + 1) % len(all_camtoworlds)
-                                next_camtoworld = torch.from_numpy(all_camtoworlds[next_cam_idx]).float().to(device)
-                                
-                                # Compute view directions for next camera
-                                view_dirs_next = compute_view_directions(means_sample, next_camtoworld.unsqueeze(0))
-                                
-                                # Compute distance between cameras
-                                cam_pos_current = camtoworlds[0, :3, 3]
-                                cam_pos_next = next_camtoworld[:3, 3]
-                                distance = torch.norm(cam_pos_current - cam_pos_next).item()
-                                
-                                # Create view pairs
-                                view_pairs = [{
-                                    'view_dir_a': view_dirs_sample,
-                                    'view_dir_b': view_dirs_next,
-                                    'distance': distance,
-                                }]
-                                
-                                loss_vis_smooth = compute_visibility_smoothness_loss(
-                                    vis_mlp,
-                                    view_pairs,
-                                    lambda_weight=cfg.lambda_vis_smooth,
-                                )
-                                loss += loss_vis_smooth
-                        except Exception as e:
-                            # Skip visibility smoothness if we can't get camera pairs
-                            if world_rank == 0 and step % 100 == 0:
-                                print(f"Warning: Could not compute visibility smoothness loss: {e}")
-                    
-                    # Reflectance spatial smoothness loss (periodic)
-                    if step % 10 == 0 and cfg.lambda_reflect_spatial > 0:
-                        loss_reflect_spatial_val = compute_reflectance_spatial_smoothness_loss(
-                            reflectance_sample,
-                            means_sample,
-                            lambda_weight=cfg.lambda_reflect_spatial,
-                        )
-                        loss_reflect_spatial = loss_reflect_spatial_val
-                        loss += loss_reflect_spatial_val
-            
+                loss += cfg.lambda_lr * lr_loss
+
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -1218,9 +1022,102 @@ class Runner:
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            # Calculate weighted loss components for analysis
+            ic_loss_weighted = cfg.lambda_ic * ic_loss.item() if cfg.enable_rose and cfg.enable_illumination_correction else 0.0
+            lr_loss_weighted = cfg.lambda_lr * lr_loss.item() if cfg.enable_rose and cfg.enable_low_rank_reg else 0.0
+            depth_loss_weighted = depthloss.item() * cfg.depth_lambda if cfg.depth_loss else 0.0
+            tv_loss_val = tvloss.item() if cfg.use_bilateral_grid else 0.0
+            opacity_reg_loss_val = cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean().item() if cfg.opacity_reg > 0.0 else 0.0
+            scale_reg_loss_val = cfg.scale_reg * torch.exp(self.splats["scales"]).mean().item() if cfg.scale_reg > 0.0 else 0.0
+            
+            # Calculate loss contributions (percentages)
+            total_loss_val = loss.item()
+            recon_contrib = (reconstruction_loss.item() / total_loss_val * 100) if total_loss_val > 0 else 0
+            ic_contrib = (ic_loss_weighted / total_loss_val * 100) if total_loss_val > 0 else 0
+            lr_contrib = (lr_loss_weighted / total_loss_val * 100) if total_loss_val > 0 else 0
+            depth_contrib = (depth_loss_weighted / total_loss_val * 100) if total_loss_val > 0 else 0
+            
+            # Get illuminance stats if available
+            illuminance_mean_val = 0.0
+            illuminance_std_val = 0.0
+            illuminance_min_val = 0.0
+            illuminance_max_val = 0.0
+            if cfg.enable_rose and "illuminances" in self.splats:
+                if cfg.enable_illuminance_constraint:
+                    illuminances_val = (
+                        cfg.illuminance_min
+                        + (cfg.illuminance_max - cfg.illuminance_min)
+                        * torch.sigmoid(self.splats["illuminances"])
+                    )
+                else:
+                    illuminances_val = torch.sigmoid(self.splats["illuminances"])
+                illuminance_mean_val = illuminances_val.mean().item()
+                illuminance_std_val = illuminances_val.std().item()
+                illuminance_min_val = illuminances_val.min().item()
+                illuminance_max_val = illuminances_val.max().item()
+            
+            # Get color statistics
+            colors_nor_mean_val = colors_nor.mean().item() if cfg.enable_rose and colors_nor is not None else 0.0
+            colors_mean_val = colors.mean().item()
+
+            # Determine phase
+            phase_str = "Phase1" if (cfg.enable_rose and cfg.enable_two_phase_training and step < cfg.geometry_warmup_steps) else "Phase2"
+            if not cfg.enable_rose or not cfg.enable_two_phase_training:
+                phase_str = "SinglePhase"
+
+            # Log to CSV at every step
+            if world_rank == 0 and self.loss_csv_writer is not None:
+                row = [
+                    step,
+                    total_loss_val,
+                    reconstruction_loss.item(),
+                    l1loss.item(),
+                    l2loss.item(),
+                    ssimloss.item(),
+                    ic_loss.item() if cfg.enable_rose and cfg.enable_illumination_correction else 0.0,
+                    ic_loss_weighted,
+                    cfg.lambda_ic if cfg.enable_rose and cfg.enable_illumination_correction else 0.0,
+                    lr_loss.item() if cfg.enable_rose and cfg.enable_low_rank_reg else 0.0,
+                    lr_loss_weighted,
+                    cfg.lambda_lr if cfg.enable_rose and cfg.enable_low_rank_reg else 0.0,
+                    depthloss.item() if cfg.depth_loss else 0.0,
+                    depth_loss_weighted,
+                    cfg.depth_lambda if cfg.depth_loss else 0.0,
+                    tv_loss_val,
+                    opacity_reg_loss_val,
+                    scale_reg_loss_val,
+                    illuminance_mean_val,
+                    illuminance_std_val,
+                    illuminance_min_val,
+                    illuminance_max_val,
+                    colors_nor_mean_val,
+                    colors_mean_val,
+                    recon_contrib,
+                    ic_contrib,
+                    lr_contrib,
+                    depth_contrib,
+                    phase_str
+                ]
+                self.loss_csv_writer.writerow(row)
+                # Flush every 100 steps to ensure data is written
+                if step % 100 == 0:
+                    self.loss_csv_file.flush()
+
+            # Enhanced progress bar description
+            desc = f"loss={loss.item():.4f}| "
+            desc += f"recon={reconstruction_loss.item():.4f}({recon_contrib:.1f}%)| "
+            if cfg.enable_rose:
+                if cfg.enable_illumination_correction:
+                    desc += f"ic={ic_loss.item():.6f}(w={ic_loss_weighted:.6f},{ic_contrib:.1f}%)| "
+                if cfg.enable_low_rank_reg:
+                    desc += f"lr={lr_loss.item():.6f}(w={lr_loss_weighted:.6f},{lr_contrib:.1f}%)| "
+                desc += f"illum_mean={illuminance_mean_val:.3f}| "
+                desc += f"C_nor_mean={colors_nor_mean_val:.3f}| "
+                if cfg.enable_two_phase_training:
+                    desc += f"{phase_str}| "
+            desc += f"sh={sh_degree_to_use}| "
             if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
+                desc += f"depth={depthloss.item():.6f}({depth_contrib:.1f}%)| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -1240,57 +1137,36 @@ class Runner:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
+                self.writer.add_scalar("train/l2loss", l2loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                self.writer.add_scalar("train/reconstruction_loss", reconstruction_loss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                if cfg.enable_rose:
+                    if cfg.enable_illumination_correction:
+                        self.writer.add_scalar("train/ic_loss", ic_loss.item(), step)
+                    if cfg.enable_low_rank_reg:
+                        self.writer.add_scalar("train/lr_loss", lr_loss.item(), step)
+                    if "illuminances" in self.splats:
+                        if cfg.enable_illuminance_constraint:
+                            illuminances_val = (
+                                cfg.illuminance_min
+                                + (cfg.illuminance_max - cfg.illuminance_min)
+                                * torch.sigmoid(self.splats["illuminances"])
+                            )
+                        else:
+                            illuminances_val = torch.sigmoid(self.splats["illuminances"])
+                        self.writer.add_scalar("train/illuminance_mean", illuminances_val.mean().item(), step)
+                        self.writer.add_scalar("train/illuminance_std", illuminances_val.std().item(), step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
-                if cfg.enable_multi_exposure:
-                    self.writer.add_scalar("train/loss_photo", loss_photo.item(), step)
-                    self.writer.add_scalar("train/loss_consist", loss_consist.item(), step)
-                    self.writer.add_scalar("train/loss_smooth", loss_smooth.item(), step)
-                    self.writer.add_scalar("train/loss_reg", loss_reg.item(), step)
-                    self.writer.add_scalar("train/loss_curriculum", loss_curriculum.item(), step)
-                    self.writer.add_scalar("train/loss_structure", loss_structure.item() if isinstance(loss_structure, torch.Tensor) else 0.0, step)
-                    self.writer.add_scalar("train/exposure_ev", current_exposure if current_exposure is not None else 0.0, step)
-                if cfg.enable_intrinsic_factorization:
-                    self.writer.add_scalar("train/loss_reflect", loss_reflect.item() if isinstance(loss_reflect, torch.Tensor) else 0.0, step)
-                    self.writer.add_scalar("train/loss_illum_smooth", loss_illum_smooth.item() if isinstance(loss_illum_smooth, torch.Tensor) else 0.0, step)
-                    self.writer.add_scalar("train/loss_vis_smooth", loss_vis_smooth.item() if isinstance(loss_vis_smooth, torch.Tensor) else 0.0, step)
-                    self.writer.add_scalar("train/loss_reflect_spatial", loss_reflect_spatial.item() if isinstance(loss_reflect_spatial, torch.Tensor) else 0.0, step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
-                
-                # CSV logging
-                if self.csv_writer is not None:
-                    row = [
-                        step,
-                        loss.item(),
-                        loss_photo.item(),
-                        loss_consist.item() if isinstance(loss_consist, torch.Tensor) else 0.0,
-                        loss_smooth.item() if isinstance(loss_smooth, torch.Tensor) else 0.0,
-                        loss_reg.item() if isinstance(loss_reg, torch.Tensor) else 0.0,
-                        loss_curriculum.item() if isinstance(loss_curriculum, torch.Tensor) else 0.0,
-                        loss_structure.item() if isinstance(loss_structure, torch.Tensor) else 0.0,
-                        loss_reflect.item() if isinstance(loss_reflect, torch.Tensor) else 0.0,
-                        loss_illum_smooth.item() if isinstance(loss_illum_smooth, torch.Tensor) else 0.0,
-                        loss_vis_smooth.item() if isinstance(loss_vis_smooth, torch.Tensor) else 0.0,
-                        loss_reflect_spatial.item() if isinstance(loss_reflect_spatial, torch.Tensor) else 0.0,
-                        current_exposure if current_exposure is not None else 0.0,
-                        len(self.splats["means"]),
-                        mem,
-                    ]
-                    self.csv_writer.writerow(row)
-                    self.csv_file_handle.flush()
-                
-                # Debug output saving
-                if cfg.debug_save_interval > 0 and step % cfg.debug_save_interval == 0:
-                    self.save_debug_outputs(step, pixels, colors, current_exposure)
 
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
@@ -1317,22 +1193,6 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
-                if cfg.enable_multi_exposure and self.perturbation_mlp is not None:
-                    if world_size > 1:
-                        data["perturbation_mlp"] = self.perturbation_mlp.module.state_dict()
-                    else:
-                        data["perturbation_mlp"] = self.perturbation_mlp.state_dict()
-                if cfg.enable_intrinsic_factorization:
-                    if self.illumination_mlp is not None:
-                        if world_size > 1:
-                            data["illumination_mlp"] = self.illumination_mlp.module.state_dict()
-                        else:
-                            data["illumination_mlp"] = self.illumination_mlp.state_dict()
-                    if self.visibility_mlp is not None:
-                        if world_size > 1:
-                            data["visibility_mlp"] = self.visibility_mlp.module.state_dict()
-                        else:
-                            data["visibility_mlp"] = self.visibility_mlp.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1412,16 +1272,6 @@ class Runner:
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            if cfg.enable_multi_exposure and self.mlp_optimizer is not None:
-                self.mlp_optimizer.step()
-                self.mlp_optimizer.zero_grad(set_to_none=True)
-            if cfg.enable_intrinsic_factorization:
-                if self.illumination_mlp_optimizer is not None:
-                    self.illumination_mlp_optimizer.step()
-                    self.illumination_mlp_optimizer.zero_grad(set_to_none=True)
-                if self.visibility_mlp_optimizer is not None:
-                    self.visibility_mlp_optimizer.step()
-                    self.visibility_mlp_optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -1468,43 +1318,12 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
-
-    @torch.no_grad()
-    def save_debug_outputs(self, step: int, pixels: Tensor, colors: Tensor, current_exposure: Optional[float]):
-        """Save debug outputs: GT vs rendered comparison images."""
-        if self.world_rank != 0:
-            return
         
-        cfg = self.cfg
-        
-        # Create side-by-side comparison: GT | Rendered
-        pixels_np = pixels.detach().cpu().numpy()  # [1, H, W, 3]
-        colors_np = colors.detach().cpu().numpy()  # [1, H, W, 3]
-        colors_np = np.clip(colors_np, 0.0, 1.0)  # Ensure valid range
-        
-        # Concatenate horizontally
-        canvas = np.concatenate([pixels_np, colors_np], axis=2)  # [1, H, 2*W, 3]
-        canvas = canvas.squeeze(0)  # [H, 2*W, 3]
-        
-        # Convert to uint8
-        canvas = (canvas * 255).astype(np.uint8)
-        
-        # Create filename with metadata
-        mlp_state = []
-        if cfg.debug_disable_perturbation_mlp:
-            mlp_state.append("no_perturb")
-        if cfg.debug_disable_illumination_mlp:
-            mlp_state.append("no_illum")
-        if cfg.debug_disable_visibility_mlp:
-            mlp_state.append("no_vis")
-        mlp_suffix = "_" + "_".join(mlp_state) if mlp_state else ""
-        exposure_suffix = f"_exp{current_exposure:.2f}" if current_exposure is not None else ""
-        
-        filename = f"{self.debug_dir}/debug_step{step:06d}{mlp_suffix}{exposure_suffix}.png"
-        imageio.imwrite(filename, canvas)
-        
-        if step % (cfg.debug_save_interval * 10) == 0:  # Print every 10 debug saves
-            print(f"Debug output saved: {filename}")
+        # Close CSV file at end of training
+        if world_rank == 0 and self.loss_csv_file is not None:
+            self.loss_csv_file.flush()
+            self.loss_csv_file.close()
+            print(f"Loss logging completed. CSV saved to: {self.loss_csv_path}")
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1641,69 +1460,35 @@ class Runner:
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
-        # Render videos with different exposure values
+        # save to video
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
-        
-        # Exposure values to render: from -3 to +3 EV in 1 EV steps
-        exposure_values = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
-        
-        # Reset debug flags for new rendering session
-        if hasattr(self, '_last_exposure_debug'):
-            delattr(self, '_last_exposure_debug')
-        if hasattr(self, '_debug_colors_printed'):
-            delattr(self, '_debug_colors_printed')
-        
-        for exposure_ev in exposure_values:
-            # Reset per-exposure debug flag
-            self._debug_colors_printed = False
-            print(f"Rendering trajectory with exposure EV={exposure_ev:.1f}...")
-            # Create filename with exposure value (format: exp0.0, exp1.0, exp-1.0)
-            exposure_str = f"{exposure_ev:+.1f}".replace("+", "")
-            writer = imageio.get_writer(f"{video_dir}/traj_{step}_exp{exposure_str}.mp4", fps=30)
-            
-            # Test illumination MLP output for this exposure (save to file for debugging)
-            if (cfg.enable_intrinsic_factorization 
-                and self.illumination_mlp is not None 
-                and not cfg.debug_disable_illumination_mlp
-                and self.world_rank == 0):
-                exposure_norm = torch.clamp(torch.tensor(exposure_ev / 2.0, device=device), -1, 1)
-                exposure_norm_test = exposure_norm.unsqueeze(0)  # [1, 1]
-                if self.world_size > 1:
-                    L_e_test = self.illumination_mlp.module(exposure_norm_test)
-                else:
-                    L_e_test = self.illumination_mlp(exposure_norm_test)
-                # Save to debug file
-                debug_log_file = f"{cfg.result_dir}/illumination_debug.txt"
-                with open(debug_log_file, "a") as f:
-                    f.write(f"Step {step}, Exposure EV={exposure_ev:.1f} (norm={exposure_norm.item():.3f}): L_e = {L_e_test.squeeze().detach().cpu().numpy()}\n")
-            
-            for i in tqdm.trange(len(camtoworlds_all), desc=f"Rendering trajectory (exp={exposure_ev:.1f})"):
-                camtoworlds = camtoworlds_all[i : i + 1]
-                Ks = K[None]
+        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
+        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
+            camtoworlds = camtoworlds_all[i : i + 1]
+            Ks = K[None]
 
-                renders, _, _ = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                    sh_degree=cfg.sh_degree,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane,
-                    render_mode="RGB+ED",
-                    exposure_ev=exposure_ev,  # Pass exposure value to enable MLPs
-                )  # [1, H, W, 4]
-                colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
-                depths = renders[..., 3:4]  # [1, H, W, 1]
-                depths = (depths - depths.min()) / (depths.max() - depths.min())
-                canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+            )  # [1, H, W, 4]
+            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
+            depths = renders[..., 3:4]  # [1, H, W, 1]
+            depths = (depths - depths.min()) / (depths.max() - depths.min())
+            canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
 
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                writer.append_data(canvas)
-            writer.close()
-            print(f"Video saved to {video_dir}/traj_{step}_exp{exposure_str}.mp4")
+            # write images
+            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+            canvas = (canvas * 255).astype(np.uint8)
+            writer.append_data(canvas)
+        writer.close()
+        print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
     def run_compression(self, step: int):
@@ -1795,14 +1580,6 @@ class Runner:
             )
         return renders
 
-    def __del__(self):
-        """Cleanup: close CSV file if open."""
-        if self.csv_file_handle is not None:
-            try:
-                self.csv_file_handle.close()
-            except:
-                pass
-
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if world_size > 1 and not cfg.disable_viewer:
@@ -1819,7 +1596,12 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             for file in cfg.ckpt
         ]
         for k in runner.splats.keys():
-            runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+            if k in ckpts[0]["splats"]:
+                runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+            else:
+                # Handle missing keys (e.g., illuminances in old checkpoints)
+                if world_rank == 0:
+                    print(f"Warning: Key '{k}' not found in checkpoint, skipping...")
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)
@@ -1827,10 +1609,6 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             runner.run_compression(step=step)
     else:
         runner.train()
-        # Close CSV file after training
-        if runner.csv_file_handle is not None:
-            runner.csv_file_handle.close()
-            runner.csv_file_handle = None
 
     if not cfg.disable_viewer:
         runner.viewer.complete()
