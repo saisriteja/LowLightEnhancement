@@ -1,4 +1,4 @@
-I’ll assume **standard 3DGS (Inria)** as the base.
+I’ll assume **standard 3DGS (Inria)** as the base. we are upgrading to rose
 
 ---
 
