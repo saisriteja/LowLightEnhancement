@@ -65,6 +65,32 @@ def inverse_tone_curve(x: torch.Tensor, epsilon: float = 1e-3) -> torch.Tensor:
     return result
 
 
+def image_tv_loss(img: torch.Tensor) -> torch.Tensor:
+    """
+    Total Variation loss for images to encourage spatial smoothness.
+    
+    Args:
+        img: Image tensor [B, H, W, C] or [B, C, H, W]
+    
+    Returns:
+        TV loss scalar
+    """
+    # Handle different input formats
+    if img.dim() == 4:
+        if img.shape[-1] == 3 or img.shape[-1] == 1:  # [B, H, W, C]
+            # Convert to [B, C, H, W] for easier gradient computation
+            img = img.permute(0, 3, 1, 2)
+        # Now img is [B, C, H, W]
+    
+    # Compute gradients in x and y directions
+    diff_x = img[:, :, :, :-1] - img[:, :, :, 1:]  # [B, C, H, W-1]
+    diff_y = img[:, :, :-1, :] - img[:, :, 1:, :]  # [B, C, H-1, W]
+    
+    # Compute TV loss as sum of absolute gradients
+    tv_loss = torch.mean(torch.abs(diff_x)) + torch.mean(torch.abs(diff_y))
+    return tv_loss
+
+
 @dataclass
 class Config:
     # Disable viewer
@@ -130,6 +156,8 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # Weight for SSIM loss in low-light mode (can be different from default)
+    ssim_lambda_lowlight: float = 0.5  # Increased for better structure preservation
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -172,6 +200,10 @@ class Config:
     illumination_target: float = 0.45
     # Weight lambda for illumination correction loss
     ic_lambda: float = 1.0
+    # Weight lambda for total variation loss
+    tv_lambda: float = 0.001  # Reduced to prevent over-smoothing
+    # Weight lambda for L1 loss in low-light mode
+    l1_lambda: float = 0.1  # Add L1 loss for better structure preservation
     # Flag to enable/disable low-light losses
     use_lowlight_losses: bool = True
 
@@ -709,7 +741,7 @@ class Runner:
                 writer = csv.writer(f)
                 writer.writerow([
                     "step", "loss", "l_mse", "l_ic", "l1loss", "ssimloss",
-                    "depthloss", "tvloss", "opacity_reg", "scale_reg"
+                    "depthloss", "tvloss", "tv_loss_img", "opacity_reg", "scale_reg"
                 ])
 
         # Training loop.
@@ -820,11 +852,15 @@ class Runner:
                     colors_low.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
                 )
                 
-                # L1 loss for pixel-level accuracy (for logging)
+                # L1 loss for pixel-level accuracy and structure preservation
                 l1loss = F.l1_loss(colors_low, pixels)
                 
-                # Total loss: combine tone-rebalanced MSE + illumination correction + SSIM for structure
-                loss = l_mse + cfg.ic_lambda * l_ic + cfg.ssim_lambda * ssimloss
+                # Total Variation loss for spatial smoothness (reduced weight to preserve structure)
+                tv_loss_img = image_tv_loss(colors_nor)  # Apply TV loss to normal-light color
+                
+                # Total loss: combine tone-rebalanced MSE + illumination correction + SSIM for structure + L1 for structure + TV for smoothness
+                # Use higher SSIM weight for low-light mode to better preserve structure
+                loss = l_mse + cfg.ic_lambda * l_ic + cfg.ssim_lambda_lowlight * ssimloss + cfg.l1_lambda * l1loss + cfg.tv_lambda * tv_loss_img
             else:
                 # Original losses
                 l1loss = F.l1_loss(colors, pixels)
@@ -834,6 +870,7 @@ class Runner:
                 loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
                 l_mse = torch.tensor(0.0, device=device)
                 l_ic = torch.tensor(0.0, device=device)
+                tv_loss_img = torch.tensor(0.0, device=device)
             depthloss = torch.tensor(0.0, device=device)
             if cfg.depth_loss:
                 # query depths from depth map
@@ -874,12 +911,13 @@ class Runner:
             # Prepare loss values for logging
             depthloss_val = depthloss.item() if cfg.depth_loss else 0.0
             tvloss_val = tvloss.item() if cfg.use_bilateral_grid else 0.0
+            tv_loss_img_val = tv_loss_img.item() if cfg.use_lowlight_losses else 0.0
             opacity_reg_val = cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean().item() if cfg.opacity_reg > 0.0 else 0.0
             scale_reg_val = cfg.scale_reg * torch.exp(self.splats["scales"]).mean().item() if cfg.scale_reg > 0.0 else 0.0
             
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.use_lowlight_losses:
-                desc += f"L_MSE={l_mse.item():.6f}| L_IC={l_ic.item():.6f}| "
+                desc += f"L_MSE={l_mse.item():.6f}| L_IC={l_ic.item():.6f}| TV={tv_loss_img.item():.6f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss_val:.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -901,6 +939,7 @@ class Runner:
                         ssimloss.item(),
                         depthloss_val,
                         tvloss_val,
+                        tv_loss_img_val,
                         opacity_reg_val,
                         scale_reg_val,
                     ])
@@ -922,6 +961,7 @@ class Runner:
                 if cfg.use_lowlight_losses:
                     self.writer.add_scalar("train/l_mse", l_mse.item(), step)
                     self.writer.add_scalar("train/l_ic", l_ic.item(), step)
+                    self.writer.add_scalar("train/tv_loss_img", tv_loss_img.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
