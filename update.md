@@ -1,289 +1,121 @@
-I’ll assume **standard 3DGS (Inria)** as the base. we are upgrading to rose
+Below is the **same decomposition + losses**, but written in **3D Gaussian Splatting (3DGS)** form (alpha-compositing / “over” operator), keeping the spirit of your NeRF equations.
 
 ---
 
-# Step-by-Step RoSe-style Gaussian Splatting
+## 1) Retinex-style decomposition (kept the same)
+
+Low-light RGB image (per pixel) is modeled as
+[
+\mathbf{C}*{low}(\mathbf{p}) ;=; \mathbf{C}*{nor}(\mathbf{p}) \odot I(\mathbf{p}),
+]
+where (\mathbf{p}) is a pixel, (\mathbf{C}_{nor}\in \mathbb{R}^3), and (I\in\mathbb{R}) is the **illuminance transition** (relative illumination ratio).
 
 ---
 
-## **Step 1: Start from Standard 3D Gaussian Splatting**
+## 2) Gaussian Splatting rendering for (\mathbf{C}_{nor}) and (I)
 
-Each Gaussian ( G_i ) has:
+Assume a set of Gaussians ({\mathcal{G}*j}*{j=1}^{M}). Each Gaussian (j) has:
+
+* 3D mean (\boldsymbol\mu_j), covariance/shape (\Sigma_j) (or scale+rotation),
+* opacity parameter (or density-like) (\alpha_j),
+* **normal-light color** (\mathbf{c}_j(\mathbf{v}) \in \mathbb{R}^3) (may be view-dependent via SH; (\mathbf{v}) is view direction),
+* **illuminance transition value** (i_j \in \mathbb{R}) (world-centered → view-independent).
+
+For a pixel (\mathbf{p}), project each Gaussian to the image plane → gives a 2D Gaussian footprint (G_j(\mathbf{p})\in[0,1]).
+Define the per-pixel alpha contribution:
 [
-G_i = (\mu_i, \Sigma_i, \alpha_i, c_i)
+a_j(\mathbf{p}) ;=; \mathrm{clamp}\big(\alpha_j , G_j(\mathbf{p}),, 0,, 1\big).
 ]
 
-Rendering:
+Sort Gaussians by depth along the ray for (\mathbf{p}) (front-to-back). Define transmittance:
 [
-\hat{C}(p) = \sum_i w_i(p), c_i
+T_1(\mathbf{p}) = 1,\qquad
+T_j(\mathbf{p}) = \prod_{k<j}\big(1-a_k(\mathbf{p})\big).
 ]
 
-This renders **observed color** directly.
+Define the standard 3DGS compositing weights:
+[
+w_j(\mathbf{p}) ;=; T_j(\mathbf{p}), a_j(\mathbf{p}).
+]
+
+### Render normal-light color
+
+[
+\widehat{\mathbf{C}}*{nor}(\mathbf{p})
+;=;
+\sum*{j=1}^{M} w_j(\mathbf{p}) , \mathbf{c}_j(\mathbf{v}).
+]
+
+### Render illuminance transition (same weights, but scalar attribute)
+
+[
+\widehat{I}(\mathbf{p})
+;=;
+\sum_{j=1}^{M} w_j(\mathbf{p}) , i_j.
+]
+
+### Reconstruct low-light pixel
+
+[
+\widehat{\mathbf{C}}*{low}(\mathbf{p})
+;=;
+\widehat{\mathbf{C}}*{nor}(\mathbf{p}) \odot \widehat{I}(\mathbf{p}).
+]
+
+That is the **Gaussian-splatting analogue** of your Eq. (6)/(8)/(3): both branches share the same visibility weights (w_j), but predict different per-primitive attributes.
 
 ---
 
-## **Step 2: Redefine the Image Formation Model**
+## 3) Losses (Gaussian-splatting form)
 
-Replace direct color rendering with:
+### (A) Tone-rebalanced reconstruction loss (pixel MSE)
 
+Use the same inverse tone curve (\phi(\cdot)) and epsilon (\varepsilon):
 [
-\boxed{
-\hat{C}*{low}(p) = \hat{C}*{nor}(p) \odot \hat{I}(p)
-}
+\phi(x)= \frac{1}{2} - \sin!\left(\frac{\sin^{-1}(1-2x)}{3}\right),
+\qquad \varepsilon = 10^{-3}.
 ]
 
-where:
-
-* ( \hat{C}_{nor} ): normal-light color
-* ( \hat{I} ): illuminance transition
-
----
-
-## **Step 3: Extend Gaussian Parameters**
-
-Each Gaussian now stores:
-
+Then (over all pixels (\mathbf{p}) in the training images):
 [
-G_i =
-(\mu_i,\Sigma_i,\alpha_i,; c_i,; i_i)
-]
-
-| Parameter              | Meaning                |
-| ---------------------- | ---------------------- |
-| (c_i \in \mathbb{R}^3) | Normal-light RGB       |
-| (i_i \in \mathbb{R}^1) | Illuminance transition |
-
-⚠️ **Constraint**
-(i_i) is **view-independent** (no SH).
-
----
-
-## **Step 4: Normal-Light Color Rendering**
-
-Use standard GS compositing:
-
-[
-\boxed{
-\hat{C}_{nor}(p) = \sum_i w_i(p), c_i
-}
-]
-
-Weights (w_i) come from:
-
-* projected Gaussian
-* opacity
-* depth ordering
-
----
-
-## **Step 5: Illuminance Transition Rendering**
-
-Use the **same weights**:
-
-[
-\boxed{
-\hat{I}(p) = \sum_i w_i(p), i_i
-}
-]
-
-✔ ensures perfect alignment
-✔ preserves geometry consistency
-
----
-
-## **Step 6: Low-Light Image Reconstruction**
-
-Final predicted image:
-
-[
-\boxed{
-\hat{C}*{low}(p) = \hat{C}*{nor}(p) \odot \hat{I}(p)
-}
-]
-
-This is the **only supervised output**.
-
----
-
-## **Step 7: Initialization**
-
-Initialize parameters as:
-
-[
-c_i \leftarrow \text{mean observed color}
-]
-
-[
-i_i \leftarrow 1.0
-]
-
-This avoids trivial collapse.
-
----
-
-## **Step 8: Inverse Tone Curve (Pre-Loss)**
-
-Dark pixels have weak gradients → rebalance them:
-
-[
-\phi(x) =
-\frac{1}{2} -
-\sin!\left(
-\frac{\sin^{-1}(1 - 2x)}{3}
-\right)
-]
-
-Apply to GT only:
-[
-C'*{low} = \phi(C*{low} + \epsilon)
-]
-
----
-
-## **Step 9: Reconstruction Loss (Main Loss)**
-
-[
-\boxed{
-\mathcal{L}_{rec}
+\mathcal{L}_{MSE}
 =================
 
-\sum_p
+\sum_{\mathbf{p}}
 \left|
-\hat{C}*{low}(p) - C'*{low}(p)
-\right|^2
-}
+\widehat{\mathbf{C}}_{low}(\mathbf{p})
+--------------------------------------
+
+\phi!\left(\mathbf{C}_{low}(\mathbf{p}) + \varepsilon\right)
+\right|_2^2 .
 ]
 
-✔ Uses **only low-light images**
-✔ Standard GS training loop remains intact
+*(This is exactly your NeRF regression loss, just with (\widehat{\mathbf{C}}_{low}) coming from splatting instead of volume rendering.)*
 
 ---
 
-## **Step 10: Illumination Correction Loss**
+### (B) Illumination correction loss (global intensity target on (\widehat{\mathbf{C}}_{nor}))
 
-Without supervision, brightness scale is ambiguous.
-
-Enforce a target illumination level:
-
+Let (e) be the desired illumination level (e.g., 0.45). With global average pooling over pixels:
 [
-\boxed{
 \mathcal{L}_{IC}
 ================
 
 \left(
-\text{mean}(\hat{C}_{nor}) - e
-\right)^2
-}
+\mathrm{GAP}\big(\widehat{\mathbf{C}}_{nor}\big) - e
+\right)^2.
 ]
 
-Where:
-
-* (e = 0.45)
-
-✔ prevents (c \downarrow, i \uparrow) degeneracy
-
 ---
 
-## **Step 11: Low-Rank Illumination Regularization**
-
-Illumination is:
-
-* smooth
-* spatially correlated
-* low-rank
-
-Noise is high-rank.
-
----
-
-### Neighborhood-based low-rank loss
-
-For spatial neighbors ((i,j)):
+### (C) Total loss
 
 [
-\boxed{
-\mathcal{L}_{LR}
-================
-
-\sum_{(i,j)}
-| i_i - i_j |^2
-}
-]
-
-✔ suppresses noise
-✔ preserves geometry
-
----
-
-## **Step 12: Illuminance Range Constraint**
-
-Avoid instability:
-
-[
-0.1 \le i_i \le 1.5
-]
-
-Implementation:
-[
-i_i = 0.1 + 1.4 \cdot \sigma(\tilde{i}_i)
-]
-
-(No explicit loss term needed.)
-
----
-
-## **Step 13: Training Schedule (Mandatory)**
-
-### Phase 1 — Geometry warm-up
-
-* Fix (i_i = 1)
-* Optimize standard GS
-* ~1–2k iterations
-
----
-
-### Phase 2 — Joint optimization
-
-* Unfreeze (i_i)
-* Enable all losses
-* Continue training
-
----
-
-## **Step 14: Final Loss Function**
-
-[
-\boxed{
 \mathcal{L}
 ===========
 
-\mathcal{L}*{rec}
+\mathcal{L}*{MSE}
 +
-\lambda*{IC}\mathcal{L}*{IC}
-+
-\lambda*{LR}\mathcal{L}_{LR}
-}
+\lambda,\mathcal{L}*{IC}.
 ]
 
-Recommended:
-
-```text
-λ_IC = 1e-3
-λ_LR = 1e-4
-```
-
----
-
-## **Step 15: Inference**
-
-Render:
-[
-\hat{C}_{nor},; \hat{I}
-]
-
-Optionally output:
-
-* enhanced image: ( \hat{C}_{nor} )
-* exposure-controlled image: ( \hat{C}_{nor} \odot \alpha )
-
----
